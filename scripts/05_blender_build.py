@@ -35,8 +35,9 @@ UV_SCALE = {"Asphalt": (6.0, 6.0), "Concrete": (1.5, 1.5), "Curb": (1.5, 1.5),
             "Glass": (28.8, 28.8), "GlassDark": (36.0, 36.0), "Office": (21.6, 21.6), "OfficeTan": (21.6, 21.6),
             "Brick": (21.6, 21.6), "Stucco": (12.0, 14.4)}
 ORTHO_UV = {"Ortho", "Roof"}          # UV = position in the orthophoto
-DIRECT_UV = {"Far", "Near", "SignAtlas"}                   # UVs already final (far-terrain imagery)
-GEOM_FILES = [C.GEOM_FILE, C.BUILD / "vegetation_geom.npz", C.BUILD / "far_geom.npz", C.BUILD / "furniture_geom.npz"]
+DIRECT_UV = {"Far", "Near", "SignAtlas", "ShopGlass", "ShopSign", "ShopTube", "Awning"}                   # UVs already final (far-terrain imagery)
+GEOM_FILES = [C.GEOM_FILE, C.BUILD / "vegetation_geom.npz", C.BUILD / "far_geom.npz", C.BUILD / "furniture_geom.npz",
+              C.BUILD / "storefront_geom.npz"]
 # street furniture previews (03e): exported to their own FBX, but in CARLA the import script spawns
 # CARLA's traffic-light / sign / streetlight blueprints at the same places instead
 FURNITURE = {"Pole", "TrafficLight", "TrafficSign"}
@@ -74,6 +75,26 @@ def make_material(mat_name):
         nm = nt.nodes.new("ShaderNodeNormalMap")
         link(tex_node(nt, f"T_{k}_N.png", True).outputs["Color"], nm.inputs["Color"])
         link(nm.outputs["Normal"], bsdf.inputs["Normal"])
+    elif mat_name in ("ShopGlass", "ShopSign", "ShopTube"):
+        # storefronts (03f): glazing / name signs / tube lights, lit at night (brighter than the floors above)
+        if mat_name == "ShopGlass":
+            d = tex_node(nt, "T_Shopfront_D.png"); e = tex_node(nt, "T_Shopfront_E.png")
+            link(d.outputs["Color"], bsdf.inputs["Base Color"]); bsdf.inputs["Roughness"].default_value = 0.08
+            bsdf.inputs["Metallic"].default_value = 0.2
+            link(e.outputs["Color"], bsdf.inputs["Emission Color"])
+        elif mat_name == "ShopSign":
+            d = tex_node(nt, "T_ShopSigns_D.png")
+            link(d.outputs["Color"], bsdf.inputs["Base Color"]); link(d.outputs["Color"], bsdf.inputs["Emission Color"])
+            bsdf.inputs["Roughness"].default_value = 0.4
+        else:
+            bsdf.inputs["Base Color"].default_value = (0.9, 0.9, 0.88, 1)
+            bsdf.inputs["Emission Color"].default_value = (1.0, 0.97, 0.9, 1)
+        g = nt.nodes.new("ShaderNodeGroup"); g.node_tree = night_group()
+        mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.inputs[1].default_value = SHOP_NITS[mat_name]
+        link(g.outputs["Night"], mul.inputs[0]); link(mul.outputs["Value"], bsdf.inputs["Emission Strength"])
+    elif mat_name == "Awning":
+        link(tex_node(nt, "T_Awnings_D.png").outputs["Color"], bsdf.inputs["Base Color"])
+        bsdf.inputs["Roughness"].default_value = 0.85
     elif mat_name == "SignAtlas":
         link(tex_node(nt, "T_Signs_D.png").outputs["Color"], bsdf.inputs["Base Color"])
         bsdf.inputs["Roughness"].default_value = 0.45
@@ -130,19 +151,15 @@ def make_material(mat_name):
     else:  # facades
         link(tex_node(nt, f"T_Facade{mat_name}_D.jpg").outputs["Color"], bsdf.inputs["Base Color"])
         link(tex_node(nt, f"T_Facade{mat_name}_R.jpg", True).outputs["Color"], bsdf.inputs["Roughness"])
-        # lit windows at night: emission map x the shared night factor (node group MM_Night, 0 = day)
+        # lit windows at night: emission map x room switching x the shared night factor (MM_Night)
         if (C.TEX / f"T_Facade{mat_name}_E.jpg").exists():
-            link(tex_node(nt, f"T_Facade{mat_name}_E.jpg").outputs["Color"], bsdf.inputs["Emission Color"])
-            g = nt.nodes.new("ShaderNodeGroup"); g.node_tree = night_group()
-            mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.inputs[1].default_value = WINDOW_NITS.get(mat_name, 1.8)
-            link(g.outputs["Night"], mul.inputs[0])
-            link(mul.outputs["Value"], bsdf.inputs["Emission Strength"])
+            add_window_emission(nt, bsdf, mat_name, tex_node(nt, f"T_Facade{mat_name}_E.jpg"))
         if mat_name.startswith("Glass"):
             bsdf.inputs["Metallic"].default_value = 0.3
     return m
 
 
-WINDOW_NITS = {"Glass": 2.2, "GlassDark": 2.2, "Office": 2.2, "OfficeTan": 2.2, "Brick": 1.4, "Stucco": 1.4}
+WINDOW_NITS = {"Glass": 0.5, "GlassDark": 0.5, "Office": 0.5, "OfficeTan": 0.5, "Brick": 0.4, "Stucco": 0.4}
 #                         emission strength of lit windows at full night (tuned in the viewport)
 
 
@@ -157,6 +174,37 @@ def night_group():
         v = ng.nodes.new("ShaderNodeValue"); v.name = "NightValue"; v.outputs[0].default_value = 0.0
         ng.links.new(v.outputs[0], out.inputs["Night"])
     return ng
+
+
+ROOM_W, FLOOR_H = 6.0, 3.6     # m: world-space light cells (one room wide, one floor high)
+SHOP_NITS = {"ShopGlass": 1.5, "ShopSign": 0.9, "ShopTube": 9.0}    # ground floor: brighter than the windows
+ROOM_ON = 0.62                 # share of rooms with the lights on
+
+
+def add_window_emission(nt, bsdf, mat_name, etex):
+    """Emission = window map x the building's light colour x per-room on/off and dimming (random per
+    world-space cell, so the texture's repetition disappears) x WINDOW_NITS x night factor."""
+    N, L = nt.nodes, nt.links.new
+    geo = N.new("ShaderNodeNewGeometry")
+    sc = N.new("ShaderNodeVectorMath"); sc.operation = "MULTIPLY"; sc.inputs[1].default_value = (1 / ROOM_W, 1 / ROOM_W, 1 / FLOOR_H)
+    fl = N.new("ShaderNodeVectorMath"); fl.operation = "FLOOR"
+    wn = N.new("ShaderNodeTexWhiteNoise"); wn.noise_dimensions = "3D"
+    L(geo.outputs["Position"], sc.inputs[0]); L(sc.outputs["Vector"], fl.inputs[0]); L(fl.outputs["Vector"], wn.inputs["Vector"])
+    on = N.new("ShaderNodeMath"); on.operation = "LESS_THAN"; on.inputs[1].default_value = ROOM_ON
+    L(wn.outputs["Value"], on.inputs[0])
+    sep = N.new("ShaderNodeSeparateColor"); L(wn.outputs["Color"], sep.inputs["Color"])
+    dim = N.new("ShaderNodeMapRange"); dim.inputs["To Min"].default_value = 0.35; dim.inputs["To Max"].default_value = 1.15
+    L(sep.outputs["Red"], dim.inputs["Value"])
+    # one light colour per building: the building's LightTint vertex colour (03d), white if absent
+    vc = N.new("ShaderNodeVertexColor"); vc.layer_name = "LightTint"
+    tint = N.new("ShaderNodeMix"); tint.data_type = "RGBA"; tint.blend_type = "MULTIPLY"; tint.inputs["Factor"].default_value = 1.0
+    L(etex.outputs["Color"], tint.inputs[6]); L(vc.outputs["Color"], tint.inputs[7])
+    L(tint.outputs[2], bsdf.inputs["Emission Color"])
+    g = N.new("ShaderNodeGroup"); g.node_tree = night_group()
+    m1 = N.new("ShaderNodeMath"); m1.operation = "MULTIPLY"; L(g.outputs["Night"], m1.inputs[0]); L(on.outputs["Value"], m1.inputs[1])
+    m2 = N.new("ShaderNodeMath"); m2.operation = "MULTIPLY"; L(m1.outputs["Value"], m2.inputs[0]); L(dim.outputs["Result"], m2.inputs[1])
+    m3 = N.new("ShaderNodeMath"); m3.operation = "MULTIPLY"; m3.inputs[1].default_value = WINDOW_NITS.get(mat_name, 1.8)
+    L(m2.outputs["Value"], m3.inputs[0]); L(m3.outputs["Value"], bsdf.inputs["Emission Strength"])
 
 
 def set_night(on):
@@ -178,7 +226,7 @@ def build_uv(mat, V, UV):
     return uv - np.floor(uv.min(0))       # keep UVs small -> no 16-bit UV precision loss in UE
 
 
-def make_object(name, V, F, UV, mat_name, label):
+def make_object(name, V, F, UV, mat_name, label, face_rgb=None):
     me = bpy.data.meshes.new(name)
     me.vertices.add(len(V)); me.vertices.foreach_set("co", V.astype(np.float32).ravel())
     me.loops.add(F.size); me.loops.foreach_set("vertex_index", F.astype(np.int32).ravel())
@@ -187,6 +235,12 @@ def make_object(name, V, F, UV, mat_name, label):
     uvl.data.foreach_set("uv", build_uv(mat_name, V, UV)[F.ravel()].astype(np.float32).ravel())
     me.update(calc_edges=True)
     me.validate(clean_customdata=False)
+    if face_rgb is None and label == "Building":   # storefronts / roofs: neutral (joins would fill black)
+        face_rgb = np.full((len(F), 3), 255, np.uint8)
+    if face_rgb is not None:                       # per-building light colour (03d) -> vertex colour
+        ca = me.color_attributes.new("LightTint", "BYTE_COLOR", "CORNER")
+        rgba = np.concatenate([np.asarray(face_rgb, np.float32) / 255.0, np.ones((len(face_rgb), 1), np.float32)], 1)
+        ca.data.foreach_set("color", np.repeat(rgba, 3, axis=0).ravel())
     me.materials.append(make_material(mat_name))
     # smooth shading with sharp edges above 30 deg: curved roads / kerbs / terrain look smooth, kerb
     # tops, building corners and barrier edges stay crisp (normals go into the FBX)
@@ -248,7 +302,7 @@ def build_scene():
         layer, tile = key.split("|")
         label, mat = layer.split("__")
         V, F, UV = g[key + "|V"], g[key + "|F"], g[key + "|UV"]
-        ob = make_object(f"{layer}_{tile}", V, F, UV, mat, label)
+        ob = make_object(f"{layer}_{tile}", V, F, UV, mat, label, g[key + "|C"] if key + "|C" in g.files else None)
         if layer in WELD:
             weld(ob)
         if layer == "Terrain__Ortho":
@@ -456,6 +510,13 @@ def render(name, loc, target, lens=24):
     print("rendered", sc.render.filepath)
 
 
+SHOP_LIGHT_RGB = {"restaurant": (1.0, 0.70, 0.43), "fast_food": (1.0, 0.93, 0.80), "cafe": (1.0, 0.75, 0.49),
+                  "bar": (0.75, 0.31, 1.0), "bank": (0.89, 0.92, 1.0), "health": (0.90, 0.96, 1.0),
+                  "hotel": (1.0, 0.77, 0.51), "theatre": (1.0, 0.88, 0.63), "fashion": (1.0, 0.93, 0.84),
+                  "grocery": (0.91, 0.94, 1.0), "culture": (1.0, 0.93, 0.82), "office": (1.0, 0.84, 0.65),
+                  "shop": (1.0, 0.89, 0.75), "generic": (1.0, 0.84, 0.66)}
+
+
 def render_night(name, loc, target, lens=24, radius=450.0):
     """Night version of a view: sun off, dark sky, windows lit, streetlight lamps (03e) near the camera."""
     sc = bpy.context.scene
@@ -468,7 +529,8 @@ def render_night(name, loc, target, lens=24, radius=450.0):
     if f.exists():
         cx, cy = loc[0], loc[1]
         for p in json.loads(f.read_text())["street_lights"]:
-            hx, hy, hz = p.get("head", (p["x"], p["y"], p["z"] + p.get("height", 9.0)))
+            arm, a = (2.6 if p.get("kind") == "freeway" else 2.2), math.radians(p["heading"])
+            hx, hy, hz = p.get("head", (p["x"] + arm * math.cos(a), p["y"] + arm * math.sin(a), p["z"] + p.get("height", 9.0) - 0.2))
             if math.hypot(hx - cx, hy - cy) > radius:
                 continue
             L = bpy.data.lights.new("lamp", "SPOT"); L.energy = 1800.0 if p.get("kind") == "freeway" else 1200.0
@@ -477,6 +539,25 @@ def render_night(name, loc, target, lens=24, radius=450.0):
                 L.use_shadow = False
             ob = bpy.data.objects.new("lamp", L); ob.location = (hx, hy, hz)   # spots point down (-Z) by default
             sc.collection.objects.link(ob); lamps.append(ob)
+    sf = C.BUILD / "storefronts.json"
+    if sf.exists():
+        S = json.loads(sf.read_text())
+        for kind, power in (("shops", 260.0), ("generic", 110.0)):
+            for p in S[kind]:
+                if math.hypot(p["x"] - loc[0], p["y"] - loc[1]) > radius:
+                    continue
+                h = math.radians(p["heading"])
+                L = bpy.data.lights.new("shoplight", "AREA"); L.shape = "RECTANGLE"
+                L.size = max(p["width"] - 0.5, 1.0); L.size_y = 2.6
+                L.energy = power * p["width"] / 8.0
+                th = SHOP_LIGHT_RGB.get(p["theme"], (1.0, 0.85, 0.7)); L.color = th
+                if hasattr(L, "use_shadow"):
+                    L.use_shadow = False
+                ob = bpy.data.objects.new("shoplight", L)
+                ob.location = (p["x"] + 0.35 * math.cos(h), p["y"] + 0.35 * math.sin(h), p["z"] + 1.7)
+                # area lights shine along local -Z: point it out of the shop and slightly down
+                ob.rotation_euler = (Vector((math.cos(h), math.sin(h), -0.35))).to_track_quat("-Z", "Y").to_euler()
+                sc.collection.objects.link(ob); lamps.append(ob)
     render(name, loc, target, lens)
     for ob in lamps:
         L = ob.data; bpy.data.objects.remove(ob); bpy.data.lights.remove(L)

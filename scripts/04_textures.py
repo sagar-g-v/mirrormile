@@ -156,39 +156,66 @@ def photo_facades():
     window_light_maps()
 
 
-# night window light (emissive) maps, aligned with the day facades. The B variants of ambientCG
-# Facade018-020 are the same facades photographed at dusk: their emission maps fit the A colour maps.
-NIGHT_EMISSION = {"Brick": "Facade018B", "Office": "Facade019B", "OfficeTan": "Facade020B"}
-# others: window panes detected in the day texture (luminance band), a share of them lit
+# night window light (emissive) maps, aligned with the day facades. The C variants of ambientCG
+# Facade018-020 are the same facades photographed at night: their emission maps fit the A colour maps.
+# Every lit window gets its own brightness, ceiling gradient and sometimes blinds or a half-drawn
+# curtain, in neutral white; the building's single light colour is applied in the material, which
+# also switches whole rooms off at random (05 / 06), so the maps carry MORE lit windows than show.
+NIGHT_EMISSION = {"Brick": "Facade018C", "Office": "Facade019C", "OfficeTan": "Facade020C"}
+# others: window panes detected in the day texture (luminance band)
 PANE_RULES = {"Glass": (0, 150), "GlassDark": (45, 200), "Stucco": (0, 110)}
-LIT_SHARE = 0.25
+LIT_SHARE = 0.45
+def _window_look(rs, h, w):
+    """Per-window light, colour-neutral (each building's single light colour is applied in the
+    material from the building's vertex colour): brightness x ceiling gradient x blinds / curtain."""
+    bright = float(np.clip(rs.lognormal(-0.45, 0.4), 0.18, 1.0))
+    yy = np.linspace(0, 1, max(h, 1))[:, None]
+    look = np.ones((h, w), np.float32) * (1.0 - 0.35 * yy ** 1.5)     # ceiling lights: brighter at the top
+    r = rs.random()
+    if r < 0.28 and h >= 8:                           # blinds: horizontal slats
+        period = max(3, h // rs.integers(5, 10))
+        look *= np.where((np.arange(h)[:, None] % period) < period * 0.45, 0.35, 1.0)
+    elif r < 0.45 and w >= 6:                         # curtain drawn over one side
+        cut = int(w * rs.uniform(0.3, 0.7))
+        side = np.arange(w)[None, :] < cut if rs.random() < 0.5 else np.arange(w)[None, :] >= cut
+        look *= np.where(side, 0.18, 1.0)
+    return np.repeat((look * 255.0 * bright)[..., None], 3, axis=2)
 
 
 def window_light_maps():
-    from scipy.ndimage import binary_erosion, label
+    from scipy.ndimage import binary_erosion, label, find_objects
     rs = np.random.default_rng(11)
-    tints = np.array([(255, 214, 150), (255, 236, 205), (225, 236, 255), (255, 196, 120)], np.float32)
     for name in ("Glass", "GlassDark", "Office", "OfficeTan", "Brick", "Stucco"):
         day = Image.open(C.TEX / f"T_Facade{name}_D.jpg").convert("RGB")
+        W, H = day.size
+        out = np.zeros((H, W, 3), np.float32)
         if name in NIGHT_EMISSION:
-            e = find(fetch(NIGHT_EMISSION[name], "2K"), "_Emission").convert("RGB").resize(day.size, Image.LANCZOS)
+            e = np.asarray(find(fetch(NIGHT_EMISSION[name], "2K"), "_Emission").convert("RGB").resize(day.size, Image.LANCZOS), np.float32)
+            lum = e.mean(2)
+            lab, n = label(lum > 25)
+            shade = lum / 255.0                           # keep the photo's interior detail as a mask
+            for i, sl in enumerate(find_objects(lab), 1):
+                if sl is None:
+                    continue
+                m = lab[sl] == i
+                if m.sum() < 30:
+                    continue
+                look = _window_look(rs, m.shape[0], m.shape[1])
+                out[sl][m] = (look * (0.55 + 0.45 * shade[sl][..., None]))[m]
         else:
             lum = np.asarray(day.convert("L"), np.float32)
             lo, hi = PANE_RULES[name]
-            pane = binary_erosion((lum > lo) & (lum < hi), iterations=max(1, day.size[0] // 400))
+            pane = binary_erosion((lum > lo) & (lum < hi), iterations=max(1, W // 400))
             lab, n = label(pane)
-            out = np.zeros((*lum.shape, 3), np.float32)
-            if n:
-                size = np.bincount(lab.ravel())
-                lit = (rs.random(n + 1) < LIT_SHARE) & (size > 0.0002 * lum.size)
-                lit[0] = False
-                col = tints[rs.integers(0, len(tints), n + 1)] * rs.uniform(0.55, 1.0, (n + 1, 1))
-                m = lit[lab]
-                out[m] = col[lab[m]]
-            e = Image.fromarray(out.clip(0, 255).astype(np.uint8))
-        e.save(C.TEX / f"T_Facade{name}_E.jpg", quality=90)
-        lit_frac = (np.asarray(e.convert("L")) > 40).mean()
-        print(f"window light map {name}: {lit_frac:.0%} of the facade lit")
+            for i, sl in enumerate(find_objects(lab), 1):
+                if sl is None or rs.random() > LIT_SHARE:
+                    continue
+                m = lab[sl] == i
+                if m.sum() < 0.0002 * lum.size:
+                    continue
+                out[sl][m] = _window_look(rs, m.shape[0], m.shape[1])[m]
+        Image.fromarray(out.clip(0, 255).astype(np.uint8)).save(C.TEX / f"T_Facade{name}_E.jpg", quality=92)
+        print(f"window light map {name}: {(out.mean(2) > 20).mean():.0%} of the facade lit (before room switching)")
 
 
 def paint():

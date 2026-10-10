@@ -10,8 +10,16 @@ sources below. Ship this file with every distributed copy of the map.
 - Elevation and lidar: **U.S. Geological Survey, 3D Elevation Program** (3DEP 1 m DEM; lidar project
   CA_LosAngeles_1_B23). Public domain.
 - Imagery: **USDA Farm Production and Conservation – NAIP**, via USGS The National Map. Public domain.
-- Materials: **ambientCG.com** (Asphalt031, Concrete047A, Concrete034, Facade001/006/018A/019A/020A),
+- Materials: **ambientCG.com** (Asphalt031, Concrete047A, Concrete034, Concrete036, Concrete028, Tiles010,
+  Facade001/006/018A/018C/019A/019C/020A/020C),
   CC0 1.0. Attribution is not required but is given here.
+
+## Business names on storefront signs
+
+Shop, restaurant, hotel and other business names and categories come from OpenStreetMap (via the
+Overpass API) and are covered by the ODbL attribution above. The names may be trademarks of their
+owners; for commercial distribution consider `GENERIC_NAMES = True` in `scripts/03f_storefronts.py`,
+which shows the business type instead.
 
 ## OpenStreetMap / ODbL
 

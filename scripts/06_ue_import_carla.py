@@ -15,6 +15,7 @@ What it does
      streetlights at the 03e positions (CARLA_PROPS)
 """
 import json
+import math
 import os
 import shutil
 
@@ -64,7 +65,12 @@ MEL = unreal.MaterialEditingLibrary
 
 EMISSIVE = {"TunnelLight": 40.0, "LampHead": 3.0}
 WINDOW_NITS = 8.0      # lit-window emissive strength at night (facades with T_Facade*_E.jpg)
-NIGHT_SIGN = 1.0       # flip to -1.0 if windows light up by day instead of at night (sun-vector convention)       # material -> emissive strength (x tinted base colour)
+NIGHT_SIGN = 1.0       # flip to -1.0 if windows light up by day instead of at night (sun-vector convention)
+ROOM_CM, FLOOR_CM, ROOM_ON = 600.0, 360.0, 0.62   # light cells (one room x one floor) and share of rooms lit
+# storefront night light: material -> (emissive texture, strength); RoomOn 1 = always lit at night
+SHOP_LIGHT = {"ShopGlass": ("T_Shopfront_E.png", 12.0), "ShopSign": ("T_ShopSigns_D.png", 6.0),
+              "ShopTube": ("/Engine/EngineResources/WhiteSquareTexture", 40.0)}
+SHOP_LAMP = dict(lumens=4500.0, generic_lumens=1800.0, height_cm=260.0, radius_cm=1400.0, max_draw_cm=12000.0)       # material -> emissive strength (x tinted base colour)
 TUNNEL_LIGHT = dict(intensity=2500.0, radius_cm=1400.0, max_draw_cm=20000.0)   # point light per fitting
 # material name (Blender slot "M_LA_DTLA_<name>") -> (basecolor, roughness, normal, tint, rough_scale, metallic)
 MATERIALS = {
@@ -81,6 +87,11 @@ MATERIALS = {
     "TunnelLight": (None, None, None, (1.0, 0.9, 0.7), 0.4, 0.0),
     # street furniture (03e): regulatory signs + posts; previews only when CARLA_PROPS = False
     "SignAtlas":  ("T_Signs_D.png", None, None, (1, 1, 1), 0.45, 0.0),
+    # storefronts (03f): night light through EmissiveTex x WindowNits (SHOP_LIGHT), never room-switched
+    "ShopGlass":  ("T_Shopfront_D.png", None, None, (1, 1, 1), 0.08, 0.2),
+    "ShopSign":   ("T_ShopSigns_D.png", None, None, (1, 1, 1), 0.4, 0.0),
+    "ShopTube":   (None, None, None, (0.9, 0.9, 0.88), 0.4, 0.0),
+    "Awning":     ("T_Awnings_D.png", None, None, (1, 1, 1), 0.85, 0.0),
     "SignPost":   (None, None, None, (0.55, 0.56, 0.58), 0.5, 0.8),
     "Metal":      (None, None, None, (0.42, 0.43, 0.44), 0.45, 0.8),
     "SignalHead": (None, None, None, (0.05, 0.05, 0.04), 0.6, 0.0),
@@ -205,10 +216,41 @@ def master_material(white_lin):
     MEL.connect_material_expressions(dusk, "", gain, "A")
     night = MEL.create_material_expression(m, unreal.MaterialExpressionSaturate, -500, 1050)
     MEL.connect_material_expressions(gain, "", night, "")
+    # rooms: random per world-space cell (ROOM_CM wide, one floor high) -> on/off and dimming;
+    # breaks the texture repetition into a natural patchwork of lit and dark rooms
+    wpos = MEL.create_material_expression(m, unreal.MaterialExpressionWorldPosition, -1500, 1300)
+    cell = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -1300, 1300)
+    csz = MEL.create_material_expression(m, unreal.MaterialExpressionConstant3Vector, -1500, 1400)
+    csz.set_editor_property("constant", unreal.LinearColor(1 / ROOM_CM, 1 / ROOM_CM, 1 / FLOOR_CM, 0))
+    MEL.connect_material_expressions(wpos, "", cell, "A"); MEL.connect_material_expressions(csz, "", cell, "B")
+    rnd = MEL.create_material_expression(m, unreal.MaterialExpressionVectorNoise, -1100, 1300)
+    rnd.set_editor_property("noise_function", unreal.VectorNoiseFunction.VNF_CELLNOISE_ALU)
+    MEL.connect_material_expressions(cell, "", rnd, "Position")
+    rr = MEL.create_material_expression(m, unreal.MaterialExpressionComponentMask, -950, 1250)
+    rr.set_editor_property("r", True); rr.set_editor_property("g", False); rr.set_editor_property("b", False)
+    rg = MEL.create_material_expression(m, unreal.MaterialExpressionComponentMask, -950, 1350)
+    rg.set_editor_property("r", False); rg.set_editor_property("g", True); rg.set_editor_property("b", False)
+    MEL.connect_material_expressions(rnd, "", rr, ""); MEL.connect_material_expressions(rnd, "", rg, "")
+    room_on = MEL.create_material_expression(m, unreal.MaterialExpressionScalarParameter, -950, 1150)
+    room_on.set_editor_property("parameter_name", "RoomOn"); room_on.set_editor_property("default_value", ROOM_ON)
+    on = MEL.create_material_expression(m, unreal.MaterialExpressionStep, -800, 1250)
+    MEL.connect_material_expressions(rr, "", on, "Y")                # 1 where RoomOn >= random
+    MEL.connect_material_expressions(room_on, "", on, "X")
+    dim = MEL.create_material_expression(m, unreal.MaterialExpressionLinearInterpolate, -800, 1350)
+    dim.set_editor_property("const_a", 0.35); dim.set_editor_property("const_b", 1.15)
+    MEL.connect_material_expressions(rg, "", dim, "Alpha")
+    # one light colour per building: the building's LightTint vertex colour (03d via the FBX)
+    tint = MEL.create_material_expression(m, unreal.MaterialExpressionVertexColor, -800, 1450)
+    w0 = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -650, 750)
+    MEL.connect_material_expressions(win_tex, "RGB", w0, "A"); MEL.connect_material_expressions(tint, "", w0, "B")
+    room = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -650, 1300)
+    MEL.connect_material_expressions(on, "", room, "A"); MEL.connect_material_expressions(dim, "", room, "B")
     w1 = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -500, 750)
-    MEL.connect_material_expressions(win_tex, "RGB", w1, "A"); MEL.connect_material_expressions(nits, "", w1, "B")
+    MEL.connect_material_expressions(w0, "", w1, "A"); MEL.connect_material_expressions(nits, "", w1, "B")
+    w1r = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -420, 850)
+    MEL.connect_material_expressions(w1, "", w1r, "A"); MEL.connect_material_expressions(room, "", w1r, "B")
     w2 = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -350, 800)
-    MEL.connect_material_expressions(w1, "", w2, "A"); MEL.connect_material_expressions(night, "", w2, "B")
+    MEL.connect_material_expressions(w1r, "", w2, "A"); MEL.connect_material_expressions(night, "", w2, "B")
     em_sum = MEL.create_material_expression(m, unreal.MaterialExpressionAdd, -200, 600)
     MEL.connect_material_expressions(mul_e, "", em_sum, "A"); MEL.connect_material_expressions(w2, "", em_sum, "B")
     MEL.connect_material_property(em_sum, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
@@ -260,6 +302,12 @@ def material_instances(master):
             MEL.set_material_instance_texture_parameter_value(mi, "BaseColorTex", texture(d))
         if name in EMISSIVE:
             MEL.set_material_instance_scalar_parameter_value(mi, "EmissiveStrength", EMISSIVE[name])
+        if name in SHOP_LIGHT:
+            src, nits_v = SHOP_LIGHT[name]
+            tex = unreal.load_asset(src) if src.startswith("/Engine") else texture(src)
+            MEL.set_material_instance_texture_parameter_value(mi, "EmissiveTex", tex)
+            MEL.set_material_instance_scalar_parameter_value(mi, "WindowNits", nits_v)
+            MEL.set_material_instance_scalar_parameter_value(mi, "RoomOn", 1.01)
         if d and d.startswith("T_Facade") and os.path.exists(f"{TEX}/{d.replace('_D.jpg', '_E.jpg')}"):
             MEL.set_material_instance_texture_parameter_value(mi, "EmissiveTex", texture(d.replace("_D.jpg", "_E.jpg")))
             MEL.set_material_instance_scalar_parameter_value(mi, "WindowNits", WINDOW_NITS)
@@ -293,6 +341,8 @@ def fbx_options(label):
     sm.set_editor_property("normal_import_method", unreal.FBXNormalImportMethod.FBXNIM_IMPORT_NORMALS)
     sm.set_editor_property("convert_scene", True)
     sm.set_editor_property("convert_scene_unit", True)
+    # keep the FBX vertex colours: buildings carry their single night light colour in them
+    sm.set_editor_property("vertex_color_import_option", unreal.VertexColorImportOption.REPLACE)
     try:
         sm.set_editor_property("build_nanite", USE_NANITE.get(label, False))
     except Exception:
@@ -419,6 +469,7 @@ def build_level(meshes):
                 comp.set_editor_property("cast_shadow", False)
     place_vegetation(eas, meshes.get("Vegetation", []))
     place_tunnel_lights(eas)
+    place_shop_lights(eas)
     if CARLA_PROPS:
         place_street_furniture(eas)
     # vehicle spawn points (map.get_spawn_points()) from CARLA's own waypoints, 0.5 m above the lane
@@ -465,6 +516,36 @@ def place_tunnel_lights(eas):
         c.set_editor_property("cast_shadows", False)
         c.set_editor_property("max_draw_distance", TUNNEL_LIGHT["max_draw_cm"])
     log("tunnel lights:", len(pts))
+
+
+def place_shop_lights(eas):
+    """A rect light in front of every lit storefront (03f) facing the street: shops light the
+    sidewalk and the road edge at night. Shadowless, culled beyond max_draw_cm."""
+    for a in eas.get_all_level_actors():
+        if a.get_actor_label().startswith(f"SH_{MAP}_"):
+            eas.destroy_actor(a)
+    f = f"{PIPE}/build/storefronts.json"
+    if not os.path.exists(f):
+        return
+    S = json.load(open(f))
+    n = 0
+    for kind in ("shops", "generic"):
+        for p in S[kind]:
+            h = math.radians(p["heading"])
+            loc = unreal.Vector((p["x"] + 0.3 * math.cos(h)) * 100, -(p["y"] + 0.3 * math.sin(h)) * 100, p["z"] * 100 + SHOP_LAMP["height_cm"])
+            a = eas.spawn_actor_from_class(unreal.RectLight, loc, unreal.Rotator(0, -20, -p["heading"]))   # out of the shop, 20 deg down
+            a.set_actor_label(f"SH_{MAP}_{n:04d}"); a.set_folder_path(f"{MAP}/ShopLights")
+            c = a.get_component_by_class(unreal.RectLightComponent)
+            c.set_mobility(unreal.ComponentMobility.MOVABLE)
+            c.set_editor_property("intensity_units", unreal.LightUnits.LUMENS)
+            c.set_editor_property("intensity", SHOP_LAMP["lumens"] if kind == "shops" else SHOP_LAMP["generic_lumens"])
+            c.set_editor_property("source_width", max(p["width"] - 0.5, 1.0) * 100)
+            c.set_editor_property("source_height", 220.0)
+            c.set_editor_property("attenuation_radius", SHOP_LAMP["radius_cm"])
+            c.set_editor_property("cast_shadows", False)
+            c.set_editor_property("max_draw_distance", SHOP_LAMP["max_draw_cm"])
+            n += 1
+    log("shop lights:", n)
 
 
 def generate_carla_signals(eas):

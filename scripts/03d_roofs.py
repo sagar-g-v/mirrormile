@@ -39,8 +39,48 @@ def components(F, n):
     return roots[F[:, 0]]
 
 
+# one light colour per building (no mixing inside a building), by building use
+WARM = [(255, 168, 98), (255, 189, 128)]                              # 2700 K, 3000 K: homes, hotels
+COOL = [(255, 207, 158), (255, 224, 192), (226, 233, 255)]            # 3500 K, 4000 K, 5000 K: offices
+RESIDENTIAL = {"apartments", "residential", "house", "hotel", "dormitory", "terrace", "detached", "semidetached_house"}
+OFFICE = {"office", "commercial", "retail", "civic", "government", "public", "hospital", "university", "school"}
+FACADES = ("Glass", "GlassDark", "Office", "OfficeTan", "Brick", "Stucco")
+
+
+def building_light_tints(g):
+    """Face colour 'C' (uint8 rgb) on every facade face = the light colour of its building."""
+    import shapely
+    polys, cols = [], []
+    for raw, tags in GB.osm_polygons():
+        p = shapely.make_valid(raw).buffer(0)
+        if p.is_empty:
+            continue
+        b = tags.get("building", tags.get("building:part", "yes"))
+        h = GB.parse_len(tags.get("height")) or 0.0
+        k = int.from_bytes(hashlib.md5(GB.building_key(raw).encode()).digest()[:4], "little")
+        pal = WARM if b in RESIDENTIAL else COOL if (b in OFFICE or h >= 40) else (WARM + COOL)
+        polys.append(p.buffer(0.6)); cols.append(pal[k % len(pal)])
+    tree = shapely.STRtree(polys)
+    cols = np.array(cols, np.uint8)
+    n = 0
+    for key in [k for k in g if k.startswith("Building__") and k.endswith("|V") and k.split("|")[0].split("__")[1] in FACADES]:
+        base = key[:-2]
+        V, F = g[base + "|V"], g[base + "|F"]
+        c = V[F].mean(1)
+        pi, ti = tree.query(shapely.points(c[:, :2]), predicate="within")
+        C_ = np.tile(np.array(COOL[1], np.uint8), (len(F), 1))
+        # smallest containing footprint wins (a part / tower inside a podium outline)
+        area = np.array([polys[t].area for t in ti])
+        order = np.argsort(-area)
+        C_[pi[order]] = cols[ti[order]]
+        g[base + "|C"] = C_
+        n += len(F)
+    print(f"building light colours: {n} facade faces tagged ({len(polys)} buildings)")
+
+
 def main():
     g = dict(np.load(C.GEOM_FILE))
+    building_light_tints(g)
     meta = json.loads(C.META_FILE.read_text())
     x0, y0, x1, y1 = meta["extent"]
     ortho = np.asarray(Image.open(C.TEX / meta["ortho"]).convert("RGB"), np.float32)
