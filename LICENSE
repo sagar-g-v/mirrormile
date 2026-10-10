@@ -1,0 +1,24 @@
+MirrorMile - Proprietary License
+
+Copyright (c) 2026 Sagar G V. All rights reserved.
+
+This software and its source code, scripts, documentation and associated files (the "Software")
+are the confidential and proprietary property of the copyright holder.
+
+No part of the Software may be used, copied, modified, merged, published, distributed,
+sublicensed, sold or otherwise made available, in source or binary form, without the prior
+written permission of the copyright holder.
+
+Permission to use the Software may be granted only by a separate written agreement with the
+copyright holder. Any such agreement governs the terms of that use.
+
+Third-party components and data used or produced by the Software (for example OpenStreetMap
+data under the ODbL, USGS / USDA public-domain data, CC0 textures, and third-party tools such as
+SUMO, Blender and CARLA) remain under their own licenses and are not covered by this license.
+See NOTICE.md for the attribution and share-alike obligations that apply to generated maps.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
