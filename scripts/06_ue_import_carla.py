@@ -62,7 +62,9 @@ AT = unreal.AssetToolsHelpers.get_asset_tools()
 EAL = unreal.EditorAssetLibrary
 MEL = unreal.MaterialEditingLibrary
 
-EMISSIVE = {"TunnelLight": 40.0, "LampHead": 3.0}       # material -> emissive strength (x tinted base colour)
+EMISSIVE = {"TunnelLight": 40.0, "LampHead": 3.0}
+WINDOW_NITS = 8.0      # lit-window emissive strength at night (facades with T_Facade*_E.jpg)
+NIGHT_SIGN = 1.0       # flip to -1.0 if windows light up by day instead of at night (sun-vector convention)       # material -> emissive strength (x tinted base colour)
 TUNNEL_LIGHT = dict(intensity=2500.0, radius_cm=1400.0, max_draw_cm=20000.0)   # point light per fitting
 # material name (Blender slot "M_LA_DTLA_<name>") -> (basecolor, roughness, normal, tint, rough_scale, metallic)
 MATERIALS = {
@@ -181,7 +183,35 @@ def master_material(white_lin):
     mul_e = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -300, 450)
     MEL.connect_material_expressions(mul_c, "", mul_e, "A")
     MEL.connect_material_expressions(em, "", mul_e, "B")
-    MEL.connect_material_property(mul_e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    # lit windows at night: EmissiveTex x WindowNits x night factor; the night factor comes from the
+    # sky-atmosphere sun direction, so CARLA's day/night weather switches the windows by itself
+    win_tex = param_tex("EmissiveTex", -800, 700, unreal.MaterialSamplerType.SAMPLERTYPE_COLOR,
+                        unreal.load_asset("/Engine/EngineResources/Black"))
+    nits = MEL.create_material_expression(m, unreal.MaterialExpressionScalarParameter, -800, 950)
+    nits.set_editor_property("parameter_name", "WindowNits"); nits.set_editor_property("default_value", 0.0)
+    sign = MEL.create_material_expression(m, unreal.MaterialExpressionScalarParameter, -1100, 1100)
+    sign.set_editor_property("parameter_name", "NightSign"); sign.set_editor_property("default_value", NIGHT_SIGN)
+    sun = MEL.create_material_expression(m, unreal.MaterialExpressionSkyAtmosphereLightDirection, -1300, 1000)
+    zc = MEL.create_material_expression(m, unreal.MaterialExpressionComponentMask, -1100, 1000)
+    zc.set_editor_property("r", False); zc.set_editor_property("g", False); zc.set_editor_property("b", True)
+    MEL.connect_material_expressions(sun, "", zc, "")
+    zup = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -950, 1050)
+    MEL.connect_material_expressions(zc, "", zup, "A"); MEL.connect_material_expressions(sign, "", zup, "B")
+    dusk = MEL.create_material_expression(m, unreal.MaterialExpressionSubtract, -800, 1050)
+    dusk.set_editor_property("const_a", 0.05)                    # fully lit once the sun is ~3 deg below
+    MEL.connect_material_expressions(zup, "", dusk, "B")
+    gain = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -650, 1050)
+    gain.set_editor_property("const_b", 10.0)
+    MEL.connect_material_expressions(dusk, "", gain, "A")
+    night = MEL.create_material_expression(m, unreal.MaterialExpressionSaturate, -500, 1050)
+    MEL.connect_material_expressions(gain, "", night, "")
+    w1 = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -500, 750)
+    MEL.connect_material_expressions(win_tex, "RGB", w1, "A"); MEL.connect_material_expressions(nits, "", w1, "B")
+    w2 = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -350, 800)
+    MEL.connect_material_expressions(w1, "", w2, "A"); MEL.connect_material_expressions(night, "", w2, "B")
+    em_sum = MEL.create_material_expression(m, unreal.MaterialExpressionAdd, -200, 600)
+    MEL.connect_material_expressions(mul_e, "", em_sum, "A"); MEL.connect_material_expressions(w2, "", em_sum, "B")
+    MEL.connect_material_property(em_sum, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(m)
     EAL.save_loaded_asset(m)
     return m
@@ -230,6 +260,9 @@ def material_instances(master):
             MEL.set_material_instance_texture_parameter_value(mi, "BaseColorTex", texture(d))
         if name in EMISSIVE:
             MEL.set_material_instance_scalar_parameter_value(mi, "EmissiveStrength", EMISSIVE[name])
+        if d and d.startswith("T_Facade") and os.path.exists(f"{TEX}/{d.replace('_D.jpg', '_E.jpg')}"):
+            MEL.set_material_instance_texture_parameter_value(mi, "EmissiveTex", texture(d.replace("_D.jpg", "_E.jpg")))
+            MEL.set_material_instance_scalar_parameter_value(mi, "WindowNits", WINDOW_NITS)
         if r:
             MEL.set_material_instance_texture_parameter_value(mi, "RoughnessTex", texture(r, "linear"))
         if n:

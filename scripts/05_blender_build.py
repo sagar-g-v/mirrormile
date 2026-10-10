@@ -130,9 +130,36 @@ def make_material(mat_name):
     else:  # facades
         link(tex_node(nt, f"T_Facade{mat_name}_D.jpg").outputs["Color"], bsdf.inputs["Base Color"])
         link(tex_node(nt, f"T_Facade{mat_name}_R.jpg", True).outputs["Color"], bsdf.inputs["Roughness"])
+        # lit windows at night: emission map x the shared night factor (node group MM_Night, 0 = day)
+        if (C.TEX / f"T_Facade{mat_name}_E.jpg").exists():
+            link(tex_node(nt, f"T_Facade{mat_name}_E.jpg").outputs["Color"], bsdf.inputs["Emission Color"])
+            g = nt.nodes.new("ShaderNodeGroup"); g.node_tree = night_group()
+            mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.inputs[1].default_value = WINDOW_NITS
+            link(g.outputs["Night"], mul.inputs[0])
+            link(mul.outputs["Value"], bsdf.inputs["Emission Strength"])
         if mat_name.startswith("Glass"):
             bsdf.inputs["Metallic"].default_value = 0.3
     return m
+
+
+WINDOW_NITS = 6.0       # emission strength of lit windows at full night
+
+
+def night_group():
+    """Shared node group holding the scene's night factor (0 = day, 1 = night) for all facades:
+    change MM_Night's value once to light every window."""
+    ng = bpy.data.node_groups.get("MM_Night")
+    if ng is None:
+        ng = bpy.data.node_groups.new("MM_Night", "ShaderNodeTree")
+        ng.interface.new_socket("Night", in_out="OUTPUT", socket_type="NodeSocketFloat")
+        out = ng.nodes.new("NodeGroupOutput")
+        v = ng.nodes.new("ShaderNodeValue"); v.name = "NightValue"; v.outputs[0].default_value = 0.0
+        ng.links.new(v.outputs[0], out.inputs["Night"])
+    return ng
+
+
+def set_night(on):
+    night_group().nodes["NightValue"].outputs[0].default_value = 1.0 if on else 0.0
 
 
 # ------------------------------------------------------------------------------ meshes
@@ -428,6 +455,35 @@ def render(name, loc, target, lens=24):
     print("rendered", sc.render.filepath)
 
 
+def render_night(name, loc, target, lens=24, radius=450.0):
+    """Night version of a view: sun off, dark sky, windows lit, streetlight lamps (03e) near the camera."""
+    sc = bpy.context.scene
+    sun = bpy.data.objects.get("Sun"); bg = sc.world.node_tree.nodes.get("Background")
+    e0, b0, x0 = sun.data.energy, bg.inputs[1].default_value, sc.view_settings.exposure
+    sun.data.energy = 0.0; bg.inputs[1].default_value = 0.004; sc.view_settings.exposure = 1.2
+    set_night(True)
+    lamps = []
+    f = C.BUILD / "street_furniture.json"
+    if f.exists():
+        cx, cy = loc[0], loc[1]
+        for p in json.loads(f.read_text())["street_lights"]:
+            hx, hy, hz = p.get("head", (p["x"], p["y"], p["z"] + p.get("height", 9.0)))
+            if math.hypot(hx - cx, hy - cy) > radius:
+                continue
+            L = bpy.data.lights.new("lamp", "SPOT"); L.energy = 900.0 if p.get("kind") == "freeway" else 600.0
+            L.spot_size = math.radians(135); L.spot_blend = 0.5; L.color = (1.0, 0.82, 0.6)
+            if hasattr(L, "use_shadow"):
+                L.use_shadow = False
+            ob = bpy.data.objects.new("lamp", L); ob.location = (hx, hy, hz)   # spots point down (-Z) by default
+            sc.collection.objects.link(ob); lamps.append(ob)
+    render(name, loc, target, lens)
+    for ob in lamps:
+        L = ob.data; bpy.data.objects.remove(ob); bpy.data.lights.remove(L)
+    sun.data.energy, bg.inputs[1].default_value, sc.view_settings.exposure = e0, b0, x0
+    set_night(False)
+    print(f"night view {name}: {len(lamps)} street lamps")
+
+
 def map_xy(lat, lon):
     """WGS84 -> map frame (local tangent approximation of the map's tmerc; ~1 m over the map)."""
     return ((lon - C.LON0) * math.cos(math.radians(C.LAT0)) * 111320.0, (lat - C.LAT0) * 110950.0)
@@ -512,6 +568,10 @@ if __name__ == "__main__":
         # Harbor Freeway in its trench with the 4th / 5th / 6th Street overpasses, looking north
         fx, fy = map_xy(34.04930, -118.26330)
         render("freeway", (fx - 60, fy - 160, 95.0), (fx + 60, fy + 160, 82.0), lens=26)
+        # night: lit office windows + streetlights (driver view and over the financial district)
+        if best:
+            render_night("night_street", (cx, cy, cz + 1.5), (cx + 80 * math.cos(hd), cy + 80 * math.sin(hd), cz + 3), lens=22)
+        render_night("night_aerial", (jx - 260, jy - 300, z + 140), (jx + 40, jy + 40, z + 40), lens=28, radius=600.0)
         bpy.ops.wm.save_as_mainfile(filepath=str(C.ROOT / "blender" / f"{MAP}.blend"), compress=True)
 
 

@@ -153,6 +153,42 @@ def photo_facades():
             col = Image.fromarray((np.asarray(col, np.float32) * (0.6 + 0.4 * a[..., None])).clip(0, 255).astype(np.uint8))
         col.save(C.TEX / f"T_Facade{name}_D.jpg", quality=92)
         find(d, "_Roughness").convert("L").resize(col.size).save(C.TEX / f"T_Facade{name}_R.jpg", quality=92)
+    window_light_maps()
+
+
+# night window light (emissive) maps, aligned with the day facades. The B variants of ambientCG
+# Facade018-020 are the same facades photographed at dusk: their emission maps fit the A colour maps.
+NIGHT_EMISSION = {"Brick": "Facade018B", "Office": "Facade019B", "OfficeTan": "Facade020B"}
+# others: window panes detected in the day texture (luminance band), a share of them lit
+PANE_RULES = {"Glass": (0, 150), "GlassDark": (45, 200), "Stucco": (0, 110)}
+LIT_SHARE = 0.25
+
+
+def window_light_maps():
+    from scipy.ndimage import binary_erosion, label
+    rs = np.random.default_rng(11)
+    tints = np.array([(255, 214, 150), (255, 236, 205), (225, 236, 255), (255, 196, 120)], np.float32)
+    for name in ("Glass", "GlassDark", "Office", "OfficeTan", "Brick", "Stucco"):
+        day = Image.open(C.TEX / f"T_Facade{name}_D.jpg").convert("RGB")
+        if name in NIGHT_EMISSION:
+            e = find(fetch(NIGHT_EMISSION[name], "2K"), "_Emission").convert("RGB").resize(day.size, Image.LANCZOS)
+        else:
+            lum = np.asarray(day.convert("L"), np.float32)
+            lo, hi = PANE_RULES[name]
+            pane = binary_erosion((lum > lo) & (lum < hi), iterations=max(1, day.size[0] // 400))
+            lab, n = label(pane)
+            out = np.zeros((*lum.shape, 3), np.float32)
+            if n:
+                size = np.bincount(lab.ravel())
+                lit = (rs.random(n + 1) < LIT_SHARE) & (size > 0.0002 * lum.size)
+                lit[0] = False
+                col = tints[rs.integers(0, len(tints), n + 1)] * rs.uniform(0.55, 1.0, (n + 1, 1))
+                m = lit[lab]
+                out[m] = col[lab[m]]
+            e = Image.fromarray(out.clip(0, 255).astype(np.uint8))
+        e.save(C.TEX / f"T_Facade{name}_E.jpg", quality=90)
+        lit_frac = (np.asarray(e.convert("L")) > 40).mean()
+        print(f"window light map {name}: {lit_frac:.0%} of the facade lit")
 
 
 def paint():
