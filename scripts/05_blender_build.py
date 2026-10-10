@@ -134,7 +134,7 @@ def make_material(mat_name):
         if (C.TEX / f"T_Facade{mat_name}_E.jpg").exists():
             link(tex_node(nt, f"T_Facade{mat_name}_E.jpg").outputs["Color"], bsdf.inputs["Emission Color"])
             g = nt.nodes.new("ShaderNodeGroup"); g.node_tree = night_group()
-            mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.inputs[1].default_value = WINDOW_NITS
+            mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.inputs[1].default_value = WINDOW_NITS.get(mat_name, 1.8)
             link(g.outputs["Night"], mul.inputs[0])
             link(mul.outputs["Value"], bsdf.inputs["Emission Strength"])
         if mat_name.startswith("Glass"):
@@ -142,7 +142,8 @@ def make_material(mat_name):
     return m
 
 
-WINDOW_NITS = 6.0       # emission strength of lit windows at full night
+WINDOW_NITS = {"Glass": 2.2, "GlassDark": 2.2, "Office": 2.2, "OfficeTan": 2.2, "Brick": 1.4, "Stucco": 1.4}
+#                         emission strength of lit windows at full night (tuned in the viewport)
 
 
 def night_group():
@@ -460,7 +461,7 @@ def render_night(name, loc, target, lens=24, radius=450.0):
     sc = bpy.context.scene
     sun = bpy.data.objects.get("Sun"); bg = sc.world.node_tree.nodes.get("Background")
     e0, b0, x0 = sun.data.energy, bg.inputs[1].default_value, sc.view_settings.exposure
-    sun.data.energy = 0.0; bg.inputs[1].default_value = 0.004; sc.view_settings.exposure = 1.2
+    sun.data.energy = 0.0; bg.inputs[1].default_value = 0.004; sc.view_settings.exposure = 0.9
     set_night(True)
     lamps = []
     f = C.BUILD / "street_furniture.json"
@@ -470,7 +471,7 @@ def render_night(name, loc, target, lens=24, radius=450.0):
             hx, hy, hz = p.get("head", (p["x"], p["y"], p["z"] + p.get("height", 9.0)))
             if math.hypot(hx - cx, hy - cy) > radius:
                 continue
-            L = bpy.data.lights.new("lamp", "SPOT"); L.energy = 900.0 if p.get("kind") == "freeway" else 600.0
+            L = bpy.data.lights.new("lamp", "SPOT"); L.energy = 1800.0 if p.get("kind") == "freeway" else 1200.0
             L.spot_size = math.radians(135); L.spot_blend = 0.5; L.color = (1.0, 0.82, 0.6)
             if hasattr(L, "use_shadow"):
                 L.use_shadow = False
