@@ -529,6 +529,7 @@ def build_level(meshes):
             a.set_actor_label(f"SP_{MAP}_{i:03d}")
             a.set_folder_path(f"{MAP}/SpawnPoints")
         log("spawn points:", len(pts))
+    guarded("setup_sky", setup_sky, eas)
     les.save_current_level()
     # sanity check of the axis convention: south-west tile must end up at UE x<0, y>0
     for sm in meshes.get("Terrain", [])[:1]:
@@ -684,6 +685,81 @@ def add_lamp(eas, p, i):
     c.set_editor_property("max_draw_distance", LAMP["max_draw_cm"])
 
 
+# ------------------------------------------------------------------------ sky / lighting
+SKY_BP = "/Game/Carla/Blueprints/LevelDesign/BP_Carla_Sky"
+SCENE_SETTINGS_BP = "/Game/Carla/Blueprints/BP_GeneralSceneSettings"
+
+
+def _bp_class(path):
+    a = unreal.load_asset(path)
+    return a.generated_class() if a else None
+
+
+def setup_sky(eas):
+    """CARLA's town lighting rig (as in Town10HD): BP_Carla_Sky (time-of-day sun / sky light / sky
+    atmosphere driven by CARLA's weather) + BP_GeneralSceneSettings, and atmosphere / volumetric
+    clouds / height fog where the sky blueprint does not bring its own. BaseMap's plain sun and sky
+    light are removed once the CARLA sky provides them (no double sun)."""
+    actors = eas.get_all_level_actors()
+    names = [a.get_class().get_name() for a in actors]
+    placed = []
+    for path, label in ((SKY_BP, "CarlaSky"), (SCENE_SETTINGS_BP, "SceneSettings")):
+        cls = _bp_class(path)
+        if cls is None:
+            log("sky: missing", path)
+            continue
+        if any(a.get_class() == cls for a in actors):
+            continue
+        a = eas.spawn_actor_from_class(cls, unreal.Vector(0, 0, 0))
+        a.set_actor_label(f"{label}_{MAP}"); a.set_folder_path(f"{MAP}/Lighting")
+        placed.append(label)
+    actors = eas.get_all_level_actors()
+
+    def has_component(kind):
+        return any(a.get_components_by_class(kind) for a in actors)
+    sky = next((a for a in actors if "Carla_Sky" in a.get_class().get_name()), None)
+    sky_comps = sorted({c.get_class().get_name() for c in sky.get_components_by_class(unreal.ActorComponent)}) if sky else []
+    log("sky: CARLA sky components:", ", ".join(sky_comps) or "none")
+    # the CARLA sky drives sun + sky light: drop BaseMap's own so there is only one sun
+    if sky and sky.get_components_by_class(unreal.DirectionalLightComponent):
+        for a in actors:
+            if isinstance(a, unreal.DirectionalLight) or isinstance(a, unreal.SkyLight):
+                if a is not sky and a.get_folder_path() != f"{MAP}/Lighting":
+                    log("sky: removed BaseMap", a.get_class().get_name(), a.get_actor_label())
+                    eas.destroy_actor(a)
+        actors = eas.get_all_level_actors()
+    for kind, actor_cls, label in ((unreal.SkyAtmosphereComponent, unreal.SkyAtmosphere, "SkyAtmosphere"),
+                                   (unreal.VolumetricCloudComponent, unreal.VolumetricCloud, "VolumetricCloud"),
+                                   (unreal.ExponentialHeightFogComponent, unreal.ExponentialHeightFog, "HeightFog")):
+        if not has_component(kind):
+            a = eas.spawn_actor_from_class(actor_cls, unreal.Vector(0, 0, 0))
+            a.set_actor_label(f"{label}_{MAP}"); a.set_folder_path(f"{MAP}/Lighting")
+            if label == "HeightFog":                  # LA haze towards the San Gabriel Mountains
+                c = a.get_component_by_class(unreal.ExponentialHeightFogComponent)
+                c.set_editor_property("fog_density", 0.008)
+                c.set_editor_property("fog_height_falloff", 0.12)
+                c.set_editor_property("start_distance", 1500.0)
+            placed.append(label)
+    if not has_component(unreal.SkyLightComponent) and not (sky and sky.get_components_by_class(unreal.SkyLightComponent)):
+        a = eas.spawn_actor_from_class(unreal.SkyLight, unreal.Vector(0, 0, 0))
+        a.set_actor_label(f"SkyLight_{MAP}"); a.set_folder_path(f"{MAP}/Lighting")
+        c = a.get_component_by_class(unreal.SkyLightComponent)
+        c.set_editor_property("real_time_capture", True)
+        c.set_mobility(unreal.ComponentMobility.MOVABLE)
+        placed.append("SkyLight")
+    log("sky: placed", ", ".join(placed) or "nothing (already set up)")
+
+
+def sky_only():
+    """Apply only the sky / lighting stage to the existing map (OSM2CARLA_STAGE=sky)."""
+    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    les.load_level(f"{MAP_DIR}/{MAP}")
+    guarded("setup_sky", setup_sky, eas)
+    les.save_current_level()
+    log("DONE (sky stage)")
+
+
 def copy_xodr():
     content = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())
     src = f"{EXPORT}/{MAP}.xodr"
@@ -702,5 +778,7 @@ def main():
     log("DONE. Open", lvl, "and press Play, or client.load_world('" + MAP + "')")
 
 
-main()
-
+if os.environ.get("OSM2CARLA_STAGE") == "sky":
+    sky_only()
+else:
+    main()
