@@ -39,6 +39,10 @@ if not CARLA_PROPS:                  # static stand-ins for CARLA's traffic ligh
     LABELS += ["Pole_Preview", "TrafficLight_Preview", "TrafficSign_Preview"]
 STREETLIGHT_NAMES = ("StreetLight", "Streetlight", "Street_Light", "StreetLamp", "Lamppost", "LampPost")
 STREETLIGHT_YAW_OFFSET = 0.0     # degrees, if the CARLA asset's arm does not point along +X
+# night lighting: every streetlight gets a downward LED spot at its lamp head unless the CARLA asset
+# already carries a light component (CARLA's own street-light blueprints are switched by its LightManager)
+LAMP = dict(lumens=12000.0, temperature=3000.0, outer_cone=68.0, inner_cone=35.0, radius_cm=3200.0,
+            max_draw_cm=18000.0, freeway_lumens=20000.0)
 MASKED = {"PalmFrond": "T_PalmFrond_D.png", "Leaves": "T_Leaves_D.png"}   # alpha-cut foliage cards
 
 # lidar species -> CARLA vegetation assets (first existing one per variant is used); the
@@ -465,7 +469,7 @@ def find_asset(keywords, root="/Game/Carla"):
 def place_street_furniture(eas):
     generate_carla_signals(eas)
     for a in eas.get_all_level_actors():
-        if a.get_actor_label().startswith(f"SL_{MAP}_"):
+        if a.get_actor_label().startswith((f"SL_{MAP}_", f"SLL_{MAP}_")):
             eas.destroy_actor(a)
     f = f"{PIPE}/build/street_furniture.json"
     if not os.path.exists(f):
@@ -473,8 +477,12 @@ def place_street_furniture(eas):
     lights = json.load(open(f))["street_lights"]
     asset, is_bp = find_asset(STREETLIGHT_NAMES)
     if asset is None:
-        log("WARNING: no CARLA streetlight asset found; set CARLA_PROPS = False to import the preview poles")
+        for i, p in enumerate(lights):
+            add_lamp(eas, p, i)
+        log("WARNING: no CARLA streetlight asset found: added", len(lights), "lamps only; "
+            "set CARLA_PROPS = False to also import the preview poles")
         return
+    n_lamps = 0
     for i, p in enumerate(lights):
         loc = unreal.Vector(p["x"] * 100, -p["y"] * 100, p["z"] * 100)
         rot = unreal.Rotator(0, 0, -p["heading"] + STREETLIGHT_YAW_OFFSET)
@@ -484,7 +492,30 @@ def place_street_furniture(eas):
             continue
         a.set_actor_label(f"SL_{MAP}_{i:04d}")
         a.set_folder_path(f"{MAP}/StreetLights")
-    log("streetlights:", len(lights), "x", asset.get_name())
+        if not a.get_components_by_class(unreal.LightComponent):
+            add_lamp(eas, p, i)
+            n_lamps += 1
+    log("streetlights:", len(lights), "x", asset.get_name(), "| own lamps added:", n_lamps)
+
+
+def add_lamp(eas, p, i):
+    """Downward shadowless LED spot at the lamp head (UE5 / Lumen: no light baking needed)."""
+    hx, hy, hz = p.get("head", (p["x"], p["y"], p["z"] + p.get("height", 9.0)))
+    sp = eas.spawn_actor_from_class(unreal.SpotLight, unreal.Vector(hx * 100, -hy * 100, hz * 100),
+                                    unreal.Rotator(0, -90, 0))          # pitch -90: straight down
+    sp.set_actor_label(f"SLL_{MAP}_{i:04d}")
+    sp.set_folder_path(f"{MAP}/StreetLights/Lamps")
+    c = sp.get_component_by_class(unreal.SpotLightComponent)
+    c.set_mobility(unreal.ComponentMobility.MOVABLE)
+    c.set_editor_property("intensity_units", unreal.LightUnits.LUMENS)
+    c.set_editor_property("intensity", LAMP["freeway_lumens"] if p.get("kind") == "freeway" else LAMP["lumens"])
+    c.set_editor_property("use_temperature", True)
+    c.set_editor_property("temperature", LAMP["temperature"])
+    c.set_editor_property("outer_cone_angle", LAMP["outer_cone"])
+    c.set_editor_property("inner_cone_angle", LAMP["inner_cone"])
+    c.set_editor_property("attenuation_radius", LAMP["radius_cm"])
+    c.set_editor_property("cast_shadows", False)
+    c.set_editor_property("max_draw_distance", LAMP["max_draw_cm"])
 
 
 def copy_xodr():

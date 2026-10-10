@@ -241,7 +241,8 @@ def street_lights(od, out, types, levels, blocked):
                 arm("Pole__Metal", (P[0], P[1], zb + H), E, r=0.05)
                 box("Pole__LampHead", (E[0], E[1]), (ux, uy), (-uy, ux), 0.35, 0.16, zb + H - 0.18, zb + H - 0.02)
                 out["street_lights"].append(dict(road=r.id, kind=kind, x=float(P[0]), y=float(P[1]), z=float(zb),
-                                                 height=H, heading=math.degrees(inward)))
+                                                 height=H, heading=math.degrees(inward),
+                                                 head=[float(E[0]), float(E[1]), float(zb + H - 0.2)]))
                 tree_pts.append([P[0], P[1]])
 
 
