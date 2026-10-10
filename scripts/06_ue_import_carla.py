@@ -115,6 +115,28 @@ def log(*a):
     unreal.log("[osm2carla] " + " ".join(str(x) for x in a))
 
 
+_WARNED = set()
+
+
+def warn_once(what, ex):
+    if what not in _WARNED:
+        _WARNED.add(what)
+        unreal.log_warning(f"[osm2carla] {what} skipped: {ex}")
+
+
+SMES = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+
+
+def guarded(name, fn, *args):
+    """Run one import stage; on failure log the traceback and carry on with the next stage."""
+    import traceback
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001
+        unreal.log_error(f"[osm2carla] stage '{name}' failed: " + traceback.format_exc())
+        return None
+
+
 # ------------------------------------------------------------------------ textures
 def import_file(path, dest, name=None, options=None):
     t = unreal.AssetImportTask()
@@ -374,19 +396,24 @@ def import_meshes(mis):
                 mi = mis.get(str(slot.get_editor_property("material_slot_name")))
                 if mi:
                     sm.set_material(i, mi)
-            src = sm.get_editor_property("source_models")
-            for sml in src:
-                b = sml.get_editor_property("build_settings")
-                b.set_editor_property("use_full_precision_u_vs", True)
-                b.set_editor_property("generate_lightmap_u_vs", False)
-                sml.set_editor_property("build_settings", b)
-            sm.set_editor_property("source_models", src)
-            body = sm.get_editor_property("body_setup")
-            if body:
-                body.set_editor_property(
-                    "collision_trace_flag",
-                    unreal.CollisionTraceFlag.CTF_USE_SIMPLE_AS_COMPLEX if no_collision(label, sm.get_name())
-                    else unreal.CollisionTraceFlag.CTF_USE_COMPLEX_AS_SIMPLE)
+            # UE5: mesh build settings go through the StaticMeshEditorSubsystem (source models are not
+            # exposed as a property); full-precision UVs keep the world-scale UVs exact
+            try:
+                bs = SMES.get_lod_build_settings(sm, 0)
+                bs.set_editor_property("use_full_precision_u_vs", True)
+                bs.set_editor_property("generate_lightmap_u_vs", False)
+                SMES.set_lod_build_settings(sm, 0, bs)
+            except Exception as ex:  # noqa: BLE001
+                warn_once("build settings", ex)
+            try:
+                body = sm.get_editor_property("body_setup")
+                if body:
+                    body.set_editor_property(
+                        "collision_trace_flag",
+                        unreal.CollisionTraceFlag.CTF_USE_SIMPLE_AS_COMPLEX if no_collision(label, sm.get_name())
+                        else unreal.CollisionTraceFlag.CTF_USE_COMPLEX_AS_SIMPLE)
+            except Exception as ex:  # noqa: BLE001
+                warn_once("collision setup", ex)
             EAL.save_loaded_asset(sm)
         meshes[label] = objs
         log(label, len(objs), "meshes ->", dest)
@@ -467,11 +494,11 @@ def build_level(meshes):
                 comp.set_collision_enabled(unreal.CollisionEnabled.NO_COLLISION)
             if label in NO_COLLISION or is_surrounding(sm.get_name()):
                 comp.set_editor_property("cast_shadow", False)
-    place_vegetation(eas, meshes.get("Vegetation", []))
-    place_tunnel_lights(eas)
-    place_shop_lights(eas)
+    guarded("place_vegetation", place_vegetation, eas, meshes.get("Vegetation", []))
+    guarded("place_tunnel_lights", place_tunnel_lights, eas)
+    guarded("place_shop_lights", place_shop_lights, eas)
     if CARLA_PROPS:
-        place_street_furniture(eas)
+        guarded("place_street_furniture", place_street_furniture, eas)
     # vehicle spawn points (map.get_spawn_points()) from CARLA's own waypoints, 0.5 m above the lane
     sp_file = f"{PIPE}/build/spawn_points.json"
     sp_cls = unreal.load_class(None, "/Script/Carla.VehicleSpawnPoint")
