@@ -20,6 +20,7 @@ Step "02 netconvert -> OpenDRIVE (+ junction joins)" { & $py scripts\02_build_xo
 Step "02b refine OpenDRIVE (junctions, lidar elevation)" { & $py scripts\02b_refine_xodr.py }
 Step "02d stop signs from OSM into the OpenDRIVE" { & $py scripts\02d_stop_signs.py }
 Step "02e speed limits (CA defaults) + speed-limit signs" { & $py scripts\02e_speed_signs.py }
+Step "02f traffic-light groups (junction controllers)" { & $py scripts\02f_signal_groups.py }
 Step "02c building massing from lidar (roof tiers)" { & $py scripts\02c_building_tiers.py }
 Step "04 textures" { & $py scripts\04_textures.py }
 Step "03 meshes" { & $py scripts\03_build_geometry.py }

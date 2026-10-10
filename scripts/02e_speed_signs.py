@@ -28,6 +28,12 @@ SIGN_EVERY = {"motorway": 1500.0, "default": 400.0}
 MPH = 0.44704
 
 
+def carla_kmh(mph):
+    """CARLA has speed-limit sign models (and Traffic Manager behaviour) for 30, 40 ... 120 km/h only:
+    the posted mph limit is shown on the nearest one (25 mph -> 40, 35 mph -> 60, 55 mph -> 90)."""
+    return int(min(120, max(30, round(mph * 1.609344 / 10.0) * 10)))
+
+
 def lane_speed_elems(r):
     out = []
     for sec in r.el.find("lanes").findall("laneSection"):
@@ -168,7 +174,7 @@ def main():
         sg = etree.SubElement(sigs, "signal", s=f"{s:.3f}", t=f"{t:.3f}", id=f"speed_{rid}_{'p' if d > 0 else 'n'}",
                               name=f"SpeedLimit{mph}mph", dynamic="no", orientation="+" if d > 0 else "-",
                               zOffset="0", country="OpenDRIVE", type="274", subtype="-1",
-                              value=str(int(round(mph * 1.609344))), unit="km/h", text=f"{mph} mph",
+                              value=str(carla_kmh(mph)), unit="km/h", text=f"{mph} mph",
                               hOffset="0", pitch="0", roll="0", height="0.9", width="0.6")
         ids = [l.id for l in lanes]
         etree.SubElement(sg, "validity", fromLane=str(min(ids, key=abs)), toLane=str(max(ids, key=abs)))
