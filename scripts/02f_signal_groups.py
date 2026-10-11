@@ -15,9 +15,46 @@ import config as C
 from opendrive import OpenDrive
 
 
+MAX_ID = 32          # CARLA: "The max size of a signal id is 32" (longer ids are truncated, warned every tick)
+
+
+def shorten_ids(root):
+    """SUMO names signals / controllers after joined junction clusters (cluster_<id>_<id>..._#1more_9,
+    up to ~60 chars). Give every id longer than MAX_ID a short unique one and update all references
+    (<control signalId>, <signalReference id>, junction controller links)."""
+    sig_map, ctl_map = {}, {}
+    for sg in root.iter("signal"):
+        sid = sg.get("id", "")
+        if len(sid) > MAX_ID:
+            sig_map[sid] = sig_map.get(sid) or f"sg{len(sig_map):05d}"
+            sg.set("id", sig_map[sid])
+    for ref in root.iter("signalReference"):
+        if ref.get("id") in sig_map:
+            ref.set("id", sig_map[ref.get("id")])
+    for ctrl in root.findall("controller"):
+        cid = ctrl.get("id", "")
+        if len(cid) > MAX_ID:
+            ctl_map[cid] = f"tc{len(ctl_map):04d}"
+            ctrl.set("id", ctl_map[cid])
+        if ctrl.get("name") and len(ctrl.get("name")) > MAX_ID:
+            ctrl.set("name", ctrl.get("id"))
+        for cs in ctrl.findall("control"):
+            if cs.get("signalId") in sig_map:
+                cs.set("signalId", sig_map[cs.get("signalId")])
+    for j in root.findall("junction"):
+        for c in j.findall("controller"):
+            if c.get("id") in ctl_map:
+                c.set("id", ctl_map[c.get("id")])
+    return len(sig_map), len(ctl_map)
+
+
 def main():
     od = OpenDrive(C.XODR_FILE)
     root = od.tree.getroot()
+    n_sig, n_ctl = shorten_ids(root)
+    od = OpenDrive.__new__(OpenDrive); od.tree = etree.ElementTree(root)     # re-read with the new ids
+    from opendrive import Road
+    od.roads = [Road(e) for e in root.findall("road")]
     sig_road = {}
     for r in od.roads:
         if r.signals is None:
@@ -56,6 +93,7 @@ def main():
             else:
                 j.append(el)
     od.tree.write(str(C.XODR_FILE), xml_declaration=True, encoding="UTF-8", pretty_print=True)
+    print(f"signal ids: {n_sig} signals and {n_ctl} controllers renamed to <= {MAX_ID} chars")
     print(f"signal groups: {sum(len(v) for v in links.values())} controllers linked to {len(links)} junctions"
           f"{f', {unlinked} without a junction' if unlinked else ''}")
 
