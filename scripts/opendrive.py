@@ -141,6 +141,9 @@ class Road:
         # elevation
         ep = el.find("elevationProfile")
         self.elev = sorted([(float(e.get("s")), _abcd(e)) for e in ep.findall("elevation")]) if ep is not None else []
+        # superelevation (roll about the reference line, positive falls to the right)
+        lp = el.find("lateralProfile")
+        self.superelev = sorted([(float(e.get("s")), _abcd(e)) for e in lp.findall("superelevation")]) if lp is not None else []
         # lanes
         lanes = el.find("lanes")
         self.offsets = sorted([(float(e.get("s")), _abcd(e)) for e in lanes.findall("laneOffset")])
@@ -180,16 +183,32 @@ class Road:
         s = np.clip(np.asarray(s, float), 0, self.length)
         return np.interp(s, self.S, self.X), np.interp(s, self.S, self.Y), np.interp(s, self.S, self.H)
 
-    def z(self, s):
+    @staticmethod
+    def _piecewise(records, s):
         s = np.asarray(s, float)
-        if not self.elev:
+        if not records:
             return np.zeros_like(s)
         out = np.zeros_like(s)
-        for i, (s0, rec) in enumerate(self.elev):
-            s1 = self.elev[i + 1][0] if i + 1 < len(self.elev) else 1e18
+        for i, (s0, rec) in enumerate(records):
+            s1 = records[i + 1][0] if i + 1 < len(records) else 1e18
             m = (s >= s0 - 1e-9) & (s < s1) if i else (s < s1)
             out[m] = _poly(rec, s[m] - s0)
         return out
+
+    def z(self, s):
+        """Elevation of the reference line."""
+        return self._piecewise(self.elev, s)
+
+    def superelevation(self, s):
+        """Roll angle [rad] about the reference line (OpenDRIVE lateralProfile/superelevation)."""
+        return self._piecewise(self.superelev, s)
+
+    def surface_z(self, s, t):
+        """Road surface height at (s, t): elevation plus t * tan(superelevation)."""
+        z = self.z(s)
+        if not self.superelev:
+            return z
+        return z + np.asarray(t, float) * np.tan(self.superelevation(s))
 
     def lane_offset(self, s):
         s = np.asarray(s, float)
@@ -204,7 +223,7 @@ class Road:
 
     def xyz(self, s, t, dz=0.0):
         x, y, h = self.ref(s)
-        return np.stack([x - t * np.sin(h), y + t * np.cos(h), self.z(s) + dz], -1)
+        return np.stack([x - t * np.sin(h), y + t * np.cos(h), self.surface_z(s, t) + dz], -1)
 
     def borders(self, sec, s):
         """Return {lane_id: (t_inner, t_outer)} for lanes of a section at positions s."""
