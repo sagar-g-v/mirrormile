@@ -24,6 +24,10 @@ SETS = {  # name: (ambientCG id, resolution, output px)
     "BridgeConc": ("Concrete036", "2K", 1024),     # weathered, water-stained: bridge fascia / underside / piers
     "TunnelTile": ("Tiles010", "1K", 1024),        # white glazed tile, tunnel lower walls (2nd St tunnel)
     "TunnelCeil": ("Concrete028", "1K", 1024),     # board-formed concrete, grimy: tunnel upper walls / ceiling
+    # ground cover (04b mask): lawn, dry LA soil, city pavers; parking lots reuse Asphalt
+    "Lawn": ("Grass005", "2K", 1024),
+    "DryGround": ("Ground109", "1K", 1024),
+    "Pavers": ("PavingStones136", "1K", 1024),
 }
 rng = np.random.default_rng(7)
 
@@ -73,6 +77,8 @@ def pbr_sets():
             c = np.asarray(col, np.float32)
             col = Image.fromarray((c * 0.78 + np.array([8, 6, 0])).clip(0, 255).astype(np.uint8))
         col.save(C.TEX / f"T_{name}_D.jpg", quality=93)
+        if name == "Lawn":       # park grass patches (03b) use the same photo lawn
+            col.save(C.TEX / "T_Grass_D.jpg", quality=93)
         nrm.save(C.TEX / f"T_{name}_N.png")
         rough.save(C.TEX / f"T_{name}_R.jpg", quality=93)
 
@@ -257,6 +263,8 @@ def vegetation_textures():
     v = (0.55 + 0.45 * np.sin(np.linspace(0, 40 * math.pi, 512))[None, :] * 0.3 + 0.4 * n)
     bark = np.stack([95 * v, 80 * v, 62 * v], -1)
     Image.fromarray(bark.clip(0, 255).astype(np.uint8)).save(C.TEX / "T_Bark_D.jpg", quality=92)
+    if (C.TEX / "T_Lawn_D.jpg").exists():   # photo lawn from pbr_sets()
+        return
     # lawn: fine green noise with darker clumps (1 tile = 2 m)
     n1, n2 = noise(1024, 1024, 8), noise(1024, 1024, 128)
     g = 0.65 + 0.25 * n1 + 0.25 * n2

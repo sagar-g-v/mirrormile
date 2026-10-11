@@ -303,7 +303,96 @@ def masked_master():
     return m
 
 
-def material_instances(master):
+GROUND_LAYERS = [   # 04b mask channel -> (texture set, tile size m); R lawn, G dry ground, B pavers, A parking
+    ("Lawn", 3.0), ("DryGround", 4.0), ("Pavers", 3.0), ("Asphalt", 6.0)]
+
+
+def ground_material(rebuild=False):
+    """Terrain ground cover: 4 tiling photo materials blended by T_LA_Ground_M (04b), which shares
+    the terrain's orthophoto UV (0..1 over the map extent). Tiling UVs = UV x extent / tile size;
+    a coarse second sample of the dry-ground colour breaks up visible repetition."""
+    path = f"{MAT_DIR}/M_{MAP}_Ground"
+    if EAL.does_asset_exist(path):
+        m = unreal.load_asset(path)
+        if not rebuild:
+            return m
+        MEL.delete_all_material_expressions(m)   # rebuild in place: never delete a material on screen
+    else:
+        m = AT.create_asset(f"M_{MAP}_Ground", MAT_DIR, unreal.Material, unreal.MaterialFactoryNew())
+    x0, y0, x1, y1 = META["extent"]
+    # UVs from world position (full precision): mesh UVs spanning 2.6 km are stored as 16-bit floats
+    # by default (~1.3 m steps), which flattens any texture to its smallest mip. UE frame = map frame
+    # x 100 with y mirrored: mask u = (X/100 - x0)/(x1 - x0), v (row 0 = north) = (y1 + Y/100)/(y1 - y0)
+    wp = MEL.create_material_expression(m, unreal.MaterialExpressionWorldPosition, -2300, 0)
+    wxy = MEL.create_material_expression(m, unreal.MaterialExpressionComponentMask, -2100, 0)
+    wxy.set_editor_property("r", True); wxy.set_editor_property("g", True)
+    wxy.set_editor_property("b", False); wxy.set_editor_property("a", False)
+    MEL.connect_material_expressions(wp, "", wxy, "")
+    sc = MEL.create_material_expression(m, unreal.MaterialExpressionConstant2Vector, -2100, -150)
+    sc.set_editor_property("r", 1.0 / (100.0 * (x1 - x0))); sc.set_editor_property("g", 1.0 / (100.0 * (y1 - y0)))
+    of = MEL.create_material_expression(m, unreal.MaterialExpressionConstant2Vector, -2100, 150)
+    of.set_editor_property("r", -x0 / (x1 - x0)); of.set_editor_property("g", y1 / (y1 - y0))
+    mul0 = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -1950, 0)
+    MEL.connect_material_expressions(wxy, "", mul0, "A"); MEL.connect_material_expressions(sc, "", mul0, "B")
+    tc = MEL.create_material_expression(m, unreal.MaterialExpressionAdd, -1800, 0)
+    MEL.connect_material_expressions(mul0, "", tc, "A"); MEL.connect_material_expressions(of, "", tc, "B")
+    mask_tex = texture("T_LA_Ground_M.png", "linear")
+    mask_tex.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_DEFAULT)
+    mask_tex.set_editor_property("virtual_texture_streaming", False)   # 4K imports default to VT (sampler mismatch)
+    EAL.save_loaded_asset(mask_tex)
+    mask = MEL.create_material_expression(m, unreal.MaterialExpressionTextureSample, -1500, -600)
+    mask.set_editor_property("texture", mask_tex)
+    mask.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+    MEL.connect_material_expressions(tc, "", mask, "UVs")
+
+    def sample(tex, sampler, uv, x, y):
+        e = MEL.create_material_expression(m, unreal.MaterialExpressionTextureSample, x, y)
+        e.set_editor_property("texture", tex); e.set_editor_property("sampler_type", sampler)
+        MEL.connect_material_expressions(uv, "", e, "UVs")
+        return e
+
+    def tiled_uv(size, y):
+        k = MEL.create_material_expression(m, unreal.MaterialExpressionConstant2Vector, -1650, y)
+        k.set_editor_property("r", 1.0 / (100.0 * size)); k.set_editor_property("g", 1.0 / (100.0 * size))
+        mul = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -1450, y)
+        MEL.connect_material_expressions(wxy, "", mul, "A"); MEL.connect_material_expressions(k, "", mul, "B")
+        return mul
+
+    sums = {"col": None, "nrm": None, "rgh": None}
+    for i, ((name, size), ch) in enumerate(zip(GROUND_LAYERS, "RGBA")):
+        y = i * 700
+        uv = tiled_uv(size, y)
+        parts = {
+            "col": (sample(texture(f"T_{name}_D.jpg"), unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, uv, -1200, y), "RGB"),
+            "nrm": (sample(texture(f"T_{name}_N.png", "normal"), unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, uv, -1200, y + 220), "RGB"),
+            "rgh": (sample(texture(f"T_{name}_R.jpg", "linear"), unreal.MaterialSamplerType.SAMPLERTYPE_MASKS, uv, -1200, y + 440), "R"),
+        }
+        for key, (e, out) in parts.items():
+            w = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -900, y + {"col": 0, "nrm": 220, "rgh": 440}[key])
+            MEL.connect_material_expressions(e, out, w, "A"); MEL.connect_material_expressions(mask, ch, w, "B")
+            if sums[key] is None:
+                sums[key] = w
+            else:
+                add = MEL.create_material_expression(m, unreal.MaterialExpressionAdd, -650, y + {"col": 0, "nrm": 220, "rgh": 440}[key])
+                MEL.connect_material_expressions(sums[key], "", add, "A"); MEL.connect_material_expressions(w, "", add, "B")
+                sums[key] = add
+    # anti-tiling: brightness variation from a 37 m sample of the dry-ground colour (0.82 .. 1.12)
+    macro = sample(texture("T_DryGround_D.jpg"), unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, tiled_uv(37.0, 3000), -1200, 3000)
+    lerp = MEL.create_material_expression(m, unreal.MaterialExpressionLinearInterpolate, -650, 3000)
+    lerp.set_editor_property("const_a", 0.82); lerp.set_editor_property("const_b", 1.12)
+    MEL.connect_material_expressions(macro, "G", lerp, "Alpha")
+    col = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -400, 0)
+    MEL.connect_material_expressions(sums["col"], "", col, "A"); MEL.connect_material_expressions(lerp, "", col, "B")
+    MEL.connect_material_property(col, "", unreal.MaterialProperty.MP_BASE_COLOR)
+    MEL.connect_material_property(sums["nrm"], "", unreal.MaterialProperty.MP_NORMAL)
+    MEL.connect_material_property(sums["rgh"], "", unreal.MaterialProperty.MP_ROUGHNESS)
+    MEL.recompile_material(m)
+    EAL.save_loaded_asset(m)
+    log("ground material:", path)
+    return m
+
+
+def material_instances(master, ground=None):
     out = {}
     mm = masked_master()
     for name, tex in MASKED.items():
@@ -320,6 +409,11 @@ def material_instances(master):
         path = f"{MAT_DIR}/{mi_name}"
         mi = unreal.load_asset(path) if EAL.does_asset_exist(path) else AT.create_asset(
             mi_name, MAT_DIR, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
+        if name == "Ortho" and ground is not None:      # terrain: ground-cover blend (04b), not the photo
+            MEL.set_material_instance_parent(mi, ground)
+            EAL.save_loaded_asset(mi, only_if_is_dirty=False)   # re-parenting does not mark it dirty
+            out[f"M_{MAP}_{name}"] = mi
+            continue
         MEL.set_material_instance_parent(mi, master)
         if d:
             MEL.set_material_instance_texture_parameter_value(mi, "BaseColorTex", texture(d))
@@ -793,18 +887,42 @@ def copy_xodr():
         os.makedirs(d, exist_ok=True)
         shutil.copy2(src, f"{d}/{MAP}.xodr")
         log("xodr ->", d)
+    # camera post-process profile: CARLA cameras load Config/PostProcess/<map>.json, else Default.json
+    # (fixed manual exposure -> black images under BP_Carla_Sky). Town10's profile uses histogram
+    # auto-exposure and matches the sky rig copied from Town10 (setup_sky)
+    pp = f"{content}Carla/Config/PostProcess"
+    if os.path.exists(f"{pp}/Town10HD_Opt.json"):
+        shutil.copy2(f"{pp}/Town10HD_Opt.json", f"{pp}/{MAP}.json")
+        log("camera post-process profile ->", f"{pp}/{MAP}.json")
 
 
 def main():
     master = master_material(make_white_linear())
-    mis = material_instances(master)
+    mis = material_instances(master, guarded("ground_material", ground_material))
     meshes = import_meshes(mis)
     copy_xodr()                      # before the level: CARLA's signal generator reads it
     lvl = build_level(meshes)
     log("DONE. Open", lvl, "and press Play, or client.load_world('" + MAP + "')")
 
 
+def ground_only():
+    """Re-point the terrain at the ground-cover material (OSM2CARLA_STAGE=ground); the terrain
+    meshes use MI_<map>_Ortho, so only that instance is re-parented, no mesh / level changes."""
+    # run headless or with the map closed: replacing textures / materials that the open level is
+    # drawing crashes the renderer (stale resources in the parallel base pass)
+    if os.environ.get("OSM2CARLA_REIMPORT_GRASS") == "1":
+        import_file(f"{TEX}/T_Grass_D.jpg", TEX_DIR, "T_Grass_D")  # park patches: the photo lawn
+    g = ground_material(rebuild=True)
+    mi = unreal.load_asset(f"{MAT_DIR}/MI_{MAP}_Ortho")
+    MEL.set_material_instance_parent(mi, g)
+    EAL.save_loaded_asset(mi, only_if_is_dirty=False)          # re-parenting does not mark it dirty
+    log("MI parent now:", mi.get_editor_property("parent").get_path_name())
+    log("DONE (ground stage): MI_" + MAP + "_Ortho ->", g.get_path_name())
+
+
 if os.environ.get("OSM2CARLA_STAGE") == "sky":
     sky_only()
+elif os.environ.get("OSM2CARLA_STAGE") == "ground":
+    ground_only()
 else:
     main()

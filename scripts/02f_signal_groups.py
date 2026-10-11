@@ -48,10 +48,22 @@ def shorten_ids(root):
     return len(sig_map), len(ctl_map)
 
 
+def ground_signals(root):
+    """SUMO writes zOffset="5" (head height) on traffic-light signals; CARLA spawns its whole pole
+    blueprint at road height + zOffset, so every traffic light would float 5 m above the street.
+    The blueprints carry their own pole height: put the signal origin on the road."""
+    n = 0
+    for sg in root.iter("signal"):
+        if sg.get("dynamic") == "yes" and float(sg.get("zOffset", 0) or 0) != 0.0:
+            sg.set("zOffset", "0"); n += 1
+    return n
+
+
 def main():
     od = OpenDrive(C.XODR_FILE)
     root = od.tree.getroot()
     n_sig, n_ctl = shorten_ids(root)
+    n_ground = ground_signals(root)
     od = OpenDrive.__new__(OpenDrive); od.tree = etree.ElementTree(root)     # re-read with the new ids
     from opendrive import Road
     od.roads = [Road(e) for e in root.findall("road")]
@@ -93,7 +105,8 @@ def main():
             else:
                 j.append(el)
     od.tree.write(str(C.XODR_FILE), xml_declaration=True, encoding="UTF-8", pretty_print=True)
-    print(f"signal ids: {n_sig} signals and {n_ctl} controllers renamed to <= {MAX_ID} chars")
+    print(f"signal ids: {n_sig} signals and {n_ctl} controllers renamed to <= {MAX_ID} chars; "
+          f"{n_ground} traffic-light signals grounded (zOffset 0)")
     print(f"signal groups: {sum(len(v) for v in links.values())} controllers linked to {len(links)} junctions"
           f"{f', {unlinked} without a junction' if unlinked else ''}")
 
