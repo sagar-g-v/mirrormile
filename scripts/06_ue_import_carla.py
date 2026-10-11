@@ -43,8 +43,12 @@ STREETLIGHT_NAMES = ("StreetLight", "Streetlight", "Street_Light", "StreetLamp",
 STREETLIGHT_YAW_OFFSET = 0.0     # degrees, if the CARLA asset's arm does not point along +X
 # night lighting: every streetlight gets a downward LED spot at its lamp head unless the CARLA asset
 # already carries a light component (CARLA's own street-light blueprints are switched by its LightManager)
-LAMP = dict(lumens=12000.0, temperature=3000.0, outer_cone=68.0, inner_cone=35.0, radius_cm=3200.0,
-            max_draw_cm=18000.0, freeway_lumens=20000.0)
+# Light levels are matched to BP_Carla_Sky (sun ~15 lux, not 100 000): real-world lumens would be
+# ~1000x too bright next to it. Values tuned with CARLA cameras at night (auto-exposure profile).
+LAMP = dict(lumens=300.0, temperature=3000.0, outer_cone=68.0, inner_cone=35.0, radius_cm=3200.0,
+            max_draw_cm=18000.0, freeway_lumens=500.0)
+STREETLIGHT_INTENSITY = 50000.0   # UCarlaLight.LightIntensity of CARLA's streetlight blueprint (default 1e7)
+NIGHT_LIGHT_TAG = "NightLight"    # CARLA weather (patched AWeather) switches tagged lights off by day
 MASKED = {"PalmFrond": "T_PalmFrond_D.png", "Leaves": "T_Leaves_D.png"}   # alpha-cut foliage cards
 
 # lidar species -> CARLA vegetation assets (first existing one per variant is used); the
@@ -65,13 +69,13 @@ EAL = unreal.EditorAssetLibrary
 MEL = unreal.MaterialEditingLibrary
 
 EMISSIVE = {"TunnelLight": 40.0, "LampHead": 3.0}
-WINDOW_NITS = 8.0      # lit-window emissive strength at night (facades with T_Facade*_E.jpg)
+WINDOW_NITS = 50.0     # lit-window emissive strength at night (facades with T_Facade*_E.jpg)
 NIGHT_SIGN = 1.0       # flip to -1.0 if windows light up by day instead of at night (sun-vector convention)
 ROOM_CM, FLOOR_CM, ROOM_ON = 600.0, 360.0, 0.62   # light cells (one room x one floor) and share of rooms lit
 # storefront night light: material -> (emissive texture, strength); RoomOn 1 = always lit at night
-SHOP_LIGHT = {"ShopGlass": ("T_Shopfront_E.png", 12.0), "ShopSign": ("T_ShopSigns_D.png", 6.0),
-              "ShopTube": ("/Engine/EngineResources/WhiteSquareTexture", 40.0)}
-SHOP_LAMP = dict(lumens=4500.0, generic_lumens=1800.0, height_cm=260.0, radius_cm=1400.0, max_draw_cm=12000.0)       # material -> emissive strength (x tinted base colour)
+SHOP_LIGHT = {"ShopGlass": ("T_Shopfront_E.png", 48.0), "ShopSign": ("T_ShopSigns_D.png", 24.0),
+              "ShopTube": ("/Engine/EngineResources/WhiteSquareTexture", 160.0)}
+SHOP_LAMP = dict(lumens=600.0, generic_lumens=240.0, height_cm=260.0, radius_cm=1400.0, max_draw_cm=12000.0)       # material -> emissive strength (x tinted base colour)
 TUNNEL_LIGHT = dict(intensity=2500.0, radius_cm=1400.0, max_draw_cm=20000.0)   # point light per fitting
 # material name (Blender slot "M_LA_DTLA_<name>") -> (basecolor, roughness, normal, tint, rough_scale, metallic)
 MATERIALS = {
@@ -674,6 +678,7 @@ def place_shop_lights(eas):
             loc = unreal.Vector((p["x"] + 0.3 * math.cos(h)) * 100, -(p["y"] + 0.3 * math.sin(h)) * 100, p["z"] * 100 + SHOP_LAMP["height_cm"])
             a = eas.spawn_actor_from_class(unreal.RectLight, loc, unreal.Rotator(0, -20, -p["heading"]))   # out of the shop, 20 deg down
             a.set_actor_label(f"SH_{MAP}_{n:04d}"); a.set_folder_path(f"{MAP}/ShopLights")
+            a.set_editor_property("tags", [unreal.Name(NIGHT_LIGHT_TAG)])
             c = a.get_component_by_class(unreal.RectLightComponent)
             c.set_mobility(unreal.ComponentMobility.MOVABLE)
             c.set_editor_property("intensity_units", unreal.LightUnits.LUMENS)
@@ -752,8 +757,9 @@ def place_street_furniture(eas):
         for k, comp in enumerate(a.get_components_by_class(CARLA_LIGHT_CLASS) if CARLA_LIGHT_CLASS else []):
             try:
                 comp.set_editor_property("id", STREETLIGHT_ID0 + i * 4 + k)
+                comp.set_editor_property("light_intensity", STREETLIGHT_INTENSITY)
             except Exception as ex:  # noqa: BLE001
-                warn_once("street light id", ex)
+                warn_once("street light id / intensity", ex)
         if not a.get_components_by_class(unreal.LightComponent):
             add_lamp(eas, p, i)
             n_lamps += 1
@@ -766,6 +772,7 @@ def add_lamp(eas, p, i):
     sp = eas.spawn_actor_from_class(unreal.SpotLight, unreal.Vector(hx * 100, -hy * 100, hz * 100),
                                     unreal.Rotator(0, -90, 0))          # pitch -90: straight down
     sp.set_actor_label(f"SLL_{MAP}_{i:04d}")
+    sp.set_editor_property("tags", [unreal.Name(NIGHT_LIGHT_TAG)])
     sp.set_folder_path(f"{MAP}/StreetLights/Lamps")
     c = sp.get_component_by_class(unreal.SpotLightComponent)
     c.set_mobility(unreal.ComponentMobility.MOVABLE)
@@ -905,6 +912,38 @@ def main():
     log("DONE. Open", lvl, "and press Play, or client.load_world('" + MAP + "')")
 
 
+def lights_only():
+    """Re-apply night light levels to the existing map (OSM2CARLA_STAGE=lights; run headless):
+    streetlight intensity, shop lights (re-placed, tagged NightLight), lit-window strength."""
+    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    les.load_level(f"{MAP_DIR}/{MAP}")
+    n = 0
+    for a in eas.get_all_level_actors():
+        if a.get_actor_label().startswith(f"SL_{MAP}_") and CARLA_LIGHT_CLASS:
+            for comp in a.get_components_by_class(CARLA_LIGHT_CLASS):
+                comp.set_editor_property("light_intensity", STREETLIGHT_INTENSITY); n += 1
+        elif a.get_actor_label().startswith(f"SLL_{MAP}_"):
+            a.set_editor_property("tags", [unreal.Name(NIGHT_LIGHT_TAG)])
+    log("streetlight intensity set on", n, "CARLA lights")
+    guarded("place_shop_lights", place_shop_lights, eas)
+    for path in EAL.list_assets(MAT_DIR, recursive=False):
+        name = path.split("/")[-1].split(".")[0]
+        if not name.startswith(f"MI_{MAP}_"):
+            continue
+        key = name[len(f"MI_{MAP}_"):]
+        mi = unreal.load_asset(path)
+        if key in SHOP_LIGHT:
+            MEL.set_material_instance_scalar_parameter_value(mi, "WindowNits", SHOP_LIGHT[key][1])
+        elif key in MATERIALS and (MATERIALS[key][0] or "").startswith("T_Facade") and                 os.path.exists(f"{TEX}/{MATERIALS[key][0].replace('_D.jpg', '_E.jpg')}"):
+            MEL.set_material_instance_scalar_parameter_value(mi, "WindowNits", WINDOW_NITS)
+        else:
+            continue
+        EAL.save_loaded_asset(mi, only_if_is_dirty=False)
+    les.save_current_level()
+    log("DONE (lights stage)")
+
+
 def ground_only():
     """Re-point the terrain at the ground-cover material (OSM2CARLA_STAGE=ground); the terrain
     meshes use MI_<map>_Ortho, so only that instance is re-parented, no mesh / level changes."""
@@ -924,5 +963,7 @@ if os.environ.get("OSM2CARLA_STAGE") == "sky":
     sky_only()
 elif os.environ.get("OSM2CARLA_STAGE") == "ground":
     ground_only()
+elif os.environ.get("OSM2CARLA_STAGE") == "lights":
+    lights_only()
 else:
     main()
