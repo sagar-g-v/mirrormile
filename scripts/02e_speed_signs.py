@@ -173,7 +173,7 @@ def main():
             anchor.addnext(sigs)
         sg = etree.SubElement(sigs, "signal", s=f"{s:.3f}", t=f"{t:.3f}", id=f"speed_{rid}_{'p' if d > 0 else 'n'}",
                               name=f"SpeedLimit{mph}mph", dynamic="no", orientation="+" if d > 0 else "-",
-                              zOffset="0", country="OpenDRIVE", type="274", subtype="-1",
+                              zOffset="0", country="OpenDRIVE", type="274", subtype=str(carla_kmh(mph)),
                               value=str(carla_kmh(mph)), unit="km/h", text=f"{mph} mph",
                               hOffset="0", pitch="0", roll="0", height="0.9", width="0.6")
         ids = [l.id for l in lanes]

@@ -530,6 +530,7 @@ def build_level(meshes):
             a.set_folder_path(f"{MAP}/SpawnPoints")
         log("spawn points:", len(pts))
     guarded("setup_sky", setup_sky, eas)
+    guarded("register_weather", register_weather)
     les.save_current_level()
     # sanity check of the axis convention: south-west tile must end up at UE x<0, y>0
     for sm in meshes.get("Terrain", [])[:1]:
@@ -750,11 +751,36 @@ def setup_sky(eas):
     log("sky: placed", ", ".join(placed) or "nothing (already set up)")
 
 
+WEATHER_BP = "/Game/Carla/Blueprints/Weather/BP_CarlaWeather"
+WEATHER_TEMPLATE_MAP = "Town10HD_Opt"
+
+
+def register_weather():
+    """CARLA's weather blueprint keeps per-map default weathers (DefaultWeathers: map name -> weather).
+    Without an entry it logs '<map> default weather not found' and the sky never gets its sun / sky
+    light values -> black scene. Register this map with Town10HD's defaults."""
+    bp = unreal.load_asset(WEATHER_BP)
+    if bp is None:
+        log("weather: missing", WEATHER_BP); return
+    cdo = unreal.get_default_object(bp.generated_class())
+    dw = cdo.get_editor_property("DefaultWeathers")
+    keys = [str(k) for k in dw.keys()]
+    if MAP in keys:
+        log("weather: default weather for", MAP, "already registered"); return
+    if WEATHER_TEMPLATE_MAP not in keys:
+        log("weather: template", WEATHER_TEMPLATE_MAP, "not in DefaultWeathers:", ", ".join(keys)); return
+    dw[MAP] = dw[WEATHER_TEMPLATE_MAP]
+    cdo.set_editor_property("DefaultWeathers", dw)
+    EAL.save_loaded_asset(bp, only_if_is_dirty=False)
+    log("weather: registered", MAP, "default weather (copy of", WEATHER_TEMPLATE_MAP + ")")
+
+
 def sky_only():
     """Apply only the sky / lighting stage to the existing map (OSM2CARLA_STAGE=sky)."""
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
     eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     les.load_level(f"{MAP_DIR}/{MAP}")
+    guarded("register_weather", register_weather)
     guarded("setup_sky", setup_sky, eas)
     les.save_current_level()
     log("DONE (sky stage)")
