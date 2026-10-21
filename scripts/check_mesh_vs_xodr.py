@@ -53,12 +53,20 @@ for (x, y, z, _, _), (clat, clon) in zip(probe, carla_ll):
     dn = (clat - lat) * 111000; de = (clon - lon) * 111000 * math.cos(math.radians(lat))
     print(f"wp UE({x:7.1f},{y:7.1f}) true {lat:.6f},{lon:.6f}  carla {clat:.6f},{clon:.6f}  err N {dn:6.1f} m  E {de:6.1f} m")
 
-# spawn points: driving lanes outside junctions, >= 30 m apart, heading from neighbouring waypoints
+# spawn points: driving lanes outside junctions, >= 30 m apart, heading from neighbouring waypoints, and not on a
+# lane that runs off the clipped map within 150 m (CARLA's Traffic Manager removes a car at the lane's end)
 cand = wps[wps[:, 3] == 0]
 sel = []
 for p in cand:
     if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 > 30 ** 2 for q in sel):
         sel.append(p)
+cf = C.BUILD / "spawn_candidates.json"
+json.dump([[float(p[0]), float(p[1]), float(p[2])] for p in sel], open(cf, "w"))
+out = subprocess.run([str(C.ROOT / "venv38/Scripts/python.exe"), str(C.ROOT / "scripts/spawn_exits.py"), str(C.XODR_FILE), str(cf)],
+                     capture_output=True, text=True)
+exits = json.loads(out.stdout.strip().splitlines()[-1])
+print(f"spawn candidates: {len(sel)}, left out (lane runs off the map within 150 m): {sum(exits)}")
+sel = [p for p, e in zip(sel, exits) if not e]
 print("spawn points:", len(sel))
 json.dump({"note": "CARLA/UE frame, metres and degrees (x, y, z, yaw)",
            "points": [[float(p[0]), float(p[1]), float(p[2]), float(p[4])] for p in sel]},

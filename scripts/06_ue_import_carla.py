@@ -647,8 +647,21 @@ def build_level(meshes):
     guarded("place_shop_lights", place_shop_lights, eas)
     if CARLA_PROPS:
         guarded("place_street_furniture", place_street_furniture, eas)
-    # vehicle spawn points (map.get_spawn_points()) from CARLA's own waypoints, 0.5 m above the lane
-    sp_file = f"{PIPE}/build/spawn_points.json"
+    place_spawn_points(eas)
+    guarded("setup_sky", setup_sky, eas)
+    guarded("register_weather", register_weather)
+    les.save_current_level()
+    # sanity check of the axis convention: south-west tile must end up at UE x<0, y>0
+    for sm in meshes.get("Terrain", [])[:1]:
+        b = sm.get_bounding_box()
+        log("first terrain tile bounds (cm):", b.min, b.max, "expect x<0 and y>0 for the SW tile")
+    return level_path
+
+
+def place_spawn_points(eas):
+    """Vehicle spawn points (map.get_spawn_points()) from check_mesh_vs_xodr.py's list (OSM2CARLA_SPAWN_FILE, default
+    build/spawn_points.json), 0.5 m above the lane; replaces the map's earlier ones."""
+    sp_file = os.environ.get("OSM2CARLA_SPAWN_FILE", f"{PIPE}/build/spawn_points.json")
     sp_cls = unreal.load_class(None, "/Script/Carla.VehicleSpawnPoint")
     for a in eas.get_all_level_actors():
         if a.get_actor_label().startswith(f"SP_{MAP}_"):
@@ -660,15 +673,16 @@ def build_level(meshes):
                                            unreal.Rotator(0, 0, yaw))   # (roll, pitch, yaw)
             a.set_actor_label(f"SP_{MAP}_{i:03d}")
             a.set_folder_path(f"{MAP}/SpawnPoints")
-        log("spawn points:", len(pts))
-    guarded("setup_sky", setup_sky, eas)
-    guarded("register_weather", register_weather)
+        log("spawn points:", len(pts), "from", sp_file)
+
+
+def spawn_only():
+    """Replace only the spawn points of the existing map (OSM2CARLA_STAGE=spawn; run headless)."""
+    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    les.load_level(f"{MAP_DIR}/{UE_MAP}")
+    place_spawn_points(actor_subsystem())
     les.save_current_level()
-    # sanity check of the axis convention: south-west tile must end up at UE x<0, y>0
-    for sm in meshes.get("Terrain", [])[:1]:
-        b = sm.get_bounding_box()
-        log("first terrain tile bounds (cm):", b.min, b.max, "expect x<0 and y>0 for the SW tile")
-    return level_path
+    log("DONE (spawn stage)")
 
 
 def place_tunnel_lights(eas):
@@ -999,5 +1013,7 @@ elif os.environ.get("OSM2CARLA_STAGE") == "ground":
     ground_only()
 elif os.environ.get("OSM2CARLA_STAGE") == "lights":
     lights_only()
+elif os.environ.get("OSM2CARLA_STAGE") == "spawn":
+    spawn_only()
 else:
     main()
