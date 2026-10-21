@@ -468,40 +468,55 @@ def build_junctions(od, net_file, drive_polys, walk_polys, junction_drive, drive
     print(f"cleanup: dropped {dropped_ov} road-strip faces overlapping another road on the same level")
 
     dtr, wtr = shapely.STRtree(drive_polys), shapely.STRtree(walk_polys)
-    net = etree.parse(str(net_file)).getroot()
-    # SUMO walking areas: the exact pedestrian corner polygons (rounded with --junctions.corner-detail),
-    # which meet the sidewalk lane ends -> seamless corner pads with a continuous kerb
     walkareas = defaultdict(list)
-    for e in net.findall("edge"):
-        if e.get("function") != "walkingarea":
-            continue
-        jid = e.get("id")[1:].rsplit("_w", 1)[0]
-        for ln in e.findall("lane"):
-            pts_ = [[float(v) for v in p.split(",")] for p in ln.get("shape", "").split()]
-            if len(pts_) < 3:
+    jlist = []   # (junction id, junction area, junction height or NaN)
+    if net_file is not None:
+        net = etree.parse(str(net_file)).getroot()
+        # SUMO walking areas: the exact pedestrian corner polygons (rounded with --junctions.corner-detail),
+        # which meet the sidewalk lane ends -> seamless corner pads with a continuous kerb
+        for e in net.findall("edge"):
+            if e.get("function") != "walkingarea":
                 continue
-            pg = shapely.make_valid(Polygon([p[:2] for p in pts_])).buffer(0)
-            if pg.is_empty or pg.area < 0.3:
+            jid = e.get("id")[1:].rsplit("_w", 1)[0]
+            for ln in e.findall("lane"):
+                pts_ = [[float(v) for v in p.split(",")] for p in ln.get("shape", "").split()]
+                if len(pts_) < 3:
+                    continue
+                pg = shapely.make_valid(Polygon([p[:2] for p in pts_])).buffer(0)
+                if pg.is_empty or pg.area < 0.3:
+                    continue
+                walkareas[jid].append((pg, float(np.mean([p[2] for p in pts_ if len(p) > 2] or [np.nan]))))
+        for j in net.findall("junction"):
+            if j.get("type") == "internal" or not j.get("shape"):
                 continue
-            walkareas[jid].append((pg, float(np.mean([p[2] for p in pts_ if len(p) > 2] or [np.nan]))))
+            pts_ = [[float(v) for v in p.split(",")] for p in j.get("shape").split()]
+            sh = np.array([p[:2] for p in pts_])
+            if len(sh) < 3:
+                continue
+            J = polys_only(Polygon(sh))
+            if J.area < 1.0:
+                continue
+            zJ = float(j.get("z")) if j.get("z") else float(np.mean([p[2] for p in pts_ if len(p) > 2] or [np.nan]))
+            jlist.append((j.get("id"), J, zJ))
+    else:
+        # OdrForge: no SUMO net. A junction's area is the union of its connecting lanes, small gaps between them
+        # closed (2 m); its corner sidewalks are connecting roads with sidewalk lanes, already among walk_polys.
+        # Height: the mean of its connecting lanes' exact surface
+        for jid, polys in junction_drive.items():
+            J = polys_only(unary_union(polys).buffer(2.0, join_style=2).buffer(-2.0, join_style=2))
+            if J.is_empty or J.area < 1.0:
+                continue
+            tri = JREF_BY.get(jid)
+            zJ = float(np.mean([v[2] for t in tri for v in t])) if tri else float("nan")
+            jlist.append((jid, J, zJ))
     patches, corners_all, d_walk = [], [], 0
     jdrive_u = unary_union([p for v in junction_drive.values() for p in v])
-    for j in net.findall("junction"):
-        if j.get("type") == "internal" or not j.get("shape"):
-            continue
-        pts_ = [[float(v) for v in p.split(",")] for p in j.get("shape").split()]
-        sh = np.array([p[:2] for p in pts_])
-        if len(sh) < 3:
-            continue
-        J = polys_only(Polygon(sh))
-        if J.area < 1.0:
-            continue
-        zJ = float(j.get("z")) if j.get("z") else float(np.mean([p[2] for p in pts_ if len(p) > 2] or [np.nan]))
+    for jid, J, zJ in jlist:
         cxy = np.array(J.representative_point().coords[0])
         Jq = J.buffer(3.0)
         di = [i for i in dtr.query(Jq) if np.isnan(zJ) or abs(z_near(DRIVE_P3[i], cxy) - zJ) < LEVEL_TOL]
         wi = [i for i in wtr.query(Jq) if np.isnan(zJ) or abs(z_near(WALK_P3[i], cxy) - zJ) < LEVEL_TOL]
-        conn_list = junction_drive.get(j.get("id"), [])
+        conn_list = junction_drive.get(jid, [])
         conn = unary_union(conn_list)
         lvl_strips = unary_union([drive_polys[i] for i in di])
         lvl_drive = unary_union([lvl_strips, conn])
@@ -509,7 +524,7 @@ def build_junctions(od, net_file, drive_polys, walk_polys, junction_drive, drive
         resid = J.difference(lvl_drive.buffer(0.02)).difference(lvl_walk.buffer(0.02))
         resid = resid.buffer(-0.15).buffer(0.15)
         fill, corners = [], []
-        wa = [p for p, zz in walkareas.get(j.get("id"), []) if np.isnan(zJ) or np.isnan(zz) or abs(zz - zJ) < LEVEL_TOL]
+        wa = [p for p, zz in walkareas.get(jid, []) if np.isnan(zJ) or np.isnan(zz) or abs(zz - zJ) < LEVEL_TOL]
         wa_u = Polygon()
         if wa:
             # corner pads = walking areas outside the driving lanes and the sidewalk strips, cleaned
@@ -540,7 +555,7 @@ def build_junctions(od, net_file, drive_polys, walk_polys, junction_drive, drive
         corner_u = diff(diff(unary_union(corners), patch), lvl_strips)
         # heights: this junction's own connecting lanes; seams blended to adjacent same-level strips
         fb = (lambda P, z0=zJ: zroad(P, None if np.isnan(z0) else np.full(len(P), z0)))
-        zj = SurfaceRef(JREF_BY.get(j.get("id"), []), fb) if JREF_BY.get(j.get("id")) else fb
+        zj = SurfaceRef(JREF_BY.get(jid, []), fb) if JREF_BY.get(jid) else fb
         sp3 = np.concatenate([DRIVE_P3[i] for i in di]) if di else None
         stree = cKDTree(sp3[:, :2]) if sp3 is not None else None
         shapely.prepare(lvl_strips)
@@ -780,11 +795,65 @@ def build_crosswalks(net_file, zroad):
             n += 1
     return n
 
+def build_crosswalks_xodr(od, zroad):
+    """Continental (ladder) crosswalks from the OpenDRIVE crosswalk objects (OdrForge: placed at the mapped crossing,
+    outline across the carriageway): the outline's v extent is the walking line, its u extent the band width."""
+    n = 0
+    placed = CROSS_BANDS
+    placed.clear()
+    for r in od.roads:
+        for ob in r.el.findall("objects/object"):
+            if ob.get("type") != "crosswalk":
+                continue
+            corners = [(float(c.get("u")), float(c.get("v"))) for c in ob.findall("outline/cornerLocal")]
+            if len(corners) < 3:
+                continue
+            s, t, hdg = float(ob.get("s")), float(ob.get("t")), float(ob.get("hdg", 0))
+            x, y, h = (float(np.ravel(a)[0]) for a in r.ref(np.array([s])))
+            o = r.xyz(np.array([s]), np.array([t]))[0]
+            th = h + hdg
+            ud, vd = np.array([np.cos(th), np.sin(th)]), np.array([-np.sin(th), np.cos(th)])
+            us, vs_ = [c[0] for c in corners], [c[1] for c in corners]
+            uc = 0.5 * (min(us) + max(us))
+            P = np.array([o[:2] + uc * ud + min(vs_) * vd, o[:2] + uc * ud + max(vs_) * vd])
+            width = max(us) - min(us)
+            zc_cross = float(o[2])
+            band = LineString(P).buffer(width / 2, cap_style="flat")
+            if any(band.intersection(q).area > 0.10 * min(band.area, q.area) for q in placed):
+                continue
+            placed.append(band)
+            a, b = P
+            d = b - a
+            L = float(np.hypot(*d))
+            if L < 2:
+                continue
+            ex = d / L
+            ey = np.array([-ex[1], ex[0]])
+            bar, gap, margin = 0.6, 0.6, 0.4
+            for vb in np.arange(margin, L - margin - bar + 1e-6, bar + gap):
+                vv = np.linspace(-width / 2 + 0.3, width / 2 - 0.3, 4)
+                A = a + vb * ex + np.outer(vv, ey)
+                B = a + (vb + bar) * ex + np.outer(vv, ey)
+                zr_ = np.full(len(A), zc_cross)
+                za, zb = zroad(A, zr_) + MARK_Z + 0.003, zroad(B, zr_) + MARK_Z + 0.003
+                LAYERS["RoadLine__White"].strip(np.column_stack([A, za]), np.column_stack([B, zb]),
+                                               np.column_stack([np.zeros(4), vv]), np.column_stack([np.ones(4), vv]))
+            n += 1
+    return n
+
+
 # ----------------------------------------------------------------------------------- terrain
-def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None):
+LANE_UNDER = 0.35      # m the terrain is kept below a vehicle lane it would otherwise poke through
+LANE_PUSH = 2.0        # m: terrain up to this far above a lane is pushed under it; higher (up to the headroom) is cut
+LANE_HEADROOM = 4.5    # m kept free above a vehicle lane (tunnel / underpass ceiling height)
+LANE_TERRAIN = {}      # terrain vertices pushed under / cut over vehicle lanes (stats)
+
+
+def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, lanes=None):
     """Terrain conformed under ground-level pavement only: bridges keep the ground under them,
     tunnels keep the ground above them (and the ground is carved where it would cut into a
-    tunnel, near its portals)."""
+    tunnel, near its portals). With lanes (lane_pieces): no terrain inside the space a car occupies
+    on any vehicle lane of any level - pushed under the lane, or cut out where it is higher up."""
     x0, y0, x1, y1 = extent
     xs = np.arange(x0, x1 + 1e-6, TERRAIN_STEP); ys = np.arange(y0, y1 + 1e-6, TERRAIN_STEP)
     GX, GY = np.meshgrid(xs, ys)
@@ -811,6 +880,23 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None):
     if inside.any():
         pz = PAVED_Z(P[inside])
         Zc[inside] = np.where(np.isnan(pz), Zc[inside], np.minimum(Zc[inside], pz - 0.30))
+    cut_v = np.zeros(len(P), bool)
+    if lanes is not None:
+        ltree, _, lz = lanes
+        vi, pk = ltree.query(shapely.points(P), predicate="dwithin", distance=0.5)
+        dz = Zc[vi] - lz[pk]
+        push = (dz > -LANE_UNDER) & (dz < LANE_PUSH)
+        np.minimum.at(Zc, vi[push], lz[pk[push]] - LANE_UNDER)
+        cut_v[vi[(dz >= LANE_PUSH) & (dz < LANE_HEADROOM)]] = True
+        # the next grid row (up to one TERRAIN_STEP out) spans the triangles that slope over the lane edge: push
+        # it under as well (no cut there - that would open holes beside the road)
+        vo, po = ltree.query(shapely.points(P), predicate="dwithin", distance=TERRAIN_STEP)
+        dzo = Zc[vo] - lz[po]
+        own = np.zeros(len(P), bool)              # ground next to a lane of its own level (a street above a trench)
+        own[vo[np.abs(dzo) < 0.5]] = True
+        band = (dzo > -LANE_UNDER) & (dzo < LANE_HEADROOM) & ~cut_v[vo] & ~own[vo]
+        np.minimum.at(Zc, vo[band], lz[po[band]] - LANE_UNDER)
+        LANE_TERRAIN.update(pushed=int(len(np.unique(np.concatenate([vi[push], vo[band]])))), cut=int(cut_v.sum()))
     nx, ny = len(xs), len(ys)
     idx = np.arange(nx * ny).reshape(ny, nx)
     a, b, c, dd = idx[:-1, :-1].ravel(), idx[:-1, 1:].ravel(), idx[1:, 1:].ravel(), idx[1:, :-1].ravel()
@@ -827,6 +913,18 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None):
             carve = np.zeros(len(F), bool)
             carve[np.flatnonzero(intun)[~np.isnan(rz) & (zc_ < rz + 0.3)]] = True
             deep |= carve
+    deep |= cut_v[F].any(1)
+    if lanes is not None:
+        # faces over a lane that still reach into the space above it: under a bridge the grid alternates between
+        # the two levels (vertices conformed to the lower road next to ones under the upper deck) and the faces
+        # between them slope through the underpass - drop them (the deck covers the gap)
+        ltree, _, lz = lanes
+        Vz = Zc[F]
+        fi, pk = ltree.query(shapely.points(P[F].mean(1)), predicate="dwithin", distance=0.5)
+        over = (Vz[fi].max(1) > lz[pk] + 0.15) & (Vz[fi].min(1) < lz[pk] + LANE_HEADROOM)
+        drop = np.zeros(len(F), bool); drop[fi[over]] = True
+        LANE_TERRAIN["faces_dropped"] = int((drop & ~deep).sum())
+        deep |= drop
     F = F[~deep]
     V = np.column_stack([P, Zc])
     UV = np.column_stack([(P[:, 0] - x0) / (x1 - x0), (P[:, 1] - y0) / (y1 - y0)])
@@ -965,7 +1063,20 @@ def build_tiered(g, tiers, base, ground, tags, tile):
     return True
 
 
-def build_buildings(dem, extent, paved):
+def lane_passage(g, base, top, lanes):
+    """g minus every vehicle lane that runs through the building's height range (a road into a garage, a
+    tunnel portal under a hillside building): the passage plus 0.3 m, with LANE_HEADROOM above the lane."""
+    if lanes is None:
+        return g, 0
+    ltree, lpolys, lz = lanes
+    k = ltree.query(g, predicate="intersects")
+    k = k[(lz[k] + LANE_HEADROOM > base) & (lz[k] < top)]
+    if not len(k):
+        return g, 0
+    return g.difference(unary_union(list(lpolys[k])).buffer(0.3)), len(k)
+
+
+def build_buildings(dem, extent, paved, lanes=None):
     box = shapely.box(*extent)
     polys = osm_polygons()
     parts = [(p, t) for p, t in polys if "building:part" in t and t.get("building:part") != "no"]
@@ -999,14 +1110,22 @@ def build_buildings(dem, extent, paved):
             minh = max(0.0, h - 1.0)
         # keep buildings off the street (OSM footprints sometimes overlap the curb)
         poly = poly.difference(paved.buffer(0.05)) if poly.intersects(paved) else poly
+        pieces = []
         for g in shapely.get_parts(poly):
             if g.geom_type != "Polygon" or g.area < 4:
                 continue
-            g = shapely.geometry.polygon.orient(g.simplify(0.15), 1.0)
             ext = np.asarray(g.exterior.coords)
             ground = float(np.min(dem(ext[:, 0], ext[:, 1])))
             base = ground + minh - (0.0 if minh else 0.5)
             top = ground + h
+            g2, nk = lane_passage(g, base, top, lanes)
+            if nk:
+                stats["lane_passages"] += 1
+            pieces += [(p, ground, base, top) for p in shapely.get_parts(g2)]
+        for g, ground, base, top in pieces:
+            if g.geom_type != "Polygon" or g.area < 4:
+                continue
+            g = shapely.geometry.polygon.orient(g.simplify(0.15), 1.0)
             tile = tile_of(*g.centroid.coords[0], extent)
             if tiers and not minh:
                 if build_tiered(g, tiers, base, ground, tags, tile):
@@ -1167,7 +1286,7 @@ def finalize_surfaces():
     L = LAYERS["Road__Asphalt"]
     V, F, UV, T = L.arrays()
     tri = shapely.polygons(V[F][:, :, :2])
-    road_u = shapely.union_all(tri[shapely.area(tri) > 1e-7], grid_size=1e-3)
+    road_u = robust_union(tri[shapely.area(tri) > 1e-7], grid=1e-3)   # as the sidewalk below (GEOS can fail on one pass)
     WV, WF, _, _ = LAYERS["SideWalk__Concrete"].arrays()
     walk_u = robust_union(shapely.polygons(WV[WF][:, :, :2]), grid=1e-3)
     vt = cKDTree(V[:, :2])
@@ -1285,6 +1404,34 @@ def wall_band(layer, P_bot, P_top_z, D, height_extra=0.0):
     oriented_strip(layer, P_bot, np.column_stack([P_bot[:, :2], P_top_z]), D)
 
 
+LANE_PIECE = 4.0      # m: vehicle-lane pieces for the same-level tests (their z is the piece mean)
+
+
+def lane_pieces(od, step=LANE_PIECE):
+    """Every vehicle lane (ROAD_TYPES, all levels) of the OpenDRIVE as (STRtree of plan polygons <= step m long,
+    their polygons, their mean z). What a car drives through, independent of how the surfaces were meshed."""
+    polys, zs = [], []
+    for r in od.roads:
+        for sec in r.sections:
+            lanes = [l for l in sec.left + sec.right if l.type in ROAD_TYPES]
+            if not lanes or sec.e - sec.s < 1e-3:
+                continue
+            n = max(2, int(math.ceil(sec.e - sec.s)) + 1)        # 1 m stations
+            s = np.linspace(sec.s, sec.e, n)
+            B, _ = r.borders(sec, s)
+            k = max(1, int(round(step)))
+            for l in lanes:
+                ti, to = B[l.id]
+                A, O = r.xyz(s, ti), r.xyz(s, to)
+                for i in range(0, n - 1, k):
+                    j = min(i + k, n - 1)
+                    p = shapely.make_valid(Polygon(np.vstack([A[i:j + 1, :2], O[i:j + 1, :2][::-1]])))
+                    if not p.is_empty and p.area > 1e-3:
+                        polys.append(p); zs.append(float(np.mean((A[i:j + 1, 2] + O[i:j + 1, 2]) / 2)))
+    polys = np.array(polys, dtype=object)
+    return shapely.STRtree(polys), polys, np.array(zs)
+
+
 def structure_footprints(od, runs, kinds=("bridge", "tunnel")):
     polys = []
     for r in od.roads:
@@ -1306,7 +1453,24 @@ def structure_footprints(od, runs, kinds=("bridge", "tunnel")):
     return unary_union(polys) if polys else Polygon()
 
 
-def build_structures(od, dem, top_z, paved_all):
+TUNNEL_ROOF = 0.6     # roof slab thickness over the ceiling (m)
+TUNNEL_MIN_H = 3.0    # lowest clear height a tunnel is squeezed to under another level
+
+
+def headroom(lanes, P, z):
+    """Height from z up to the lowest vehicle lane of another level (> 2 m higher) over the plan points P; inf if none."""
+    out = np.full(len(P), np.inf)
+    if lanes is None:
+        return out
+    tree, _, lz = lanes
+    vi, pk = tree.query(shapely.points(P), predicate="intersects")
+    dz = lz[pk] - z[vi]
+    up = dz > 2.0
+    np.minimum.at(out, vi[up], dz[up])
+    return out
+
+
+def build_structures(od, dem, top_z, paved_all, lane_idx=None):
     """Bridge decks / fascia / parapets / piers, tunnel shells, freeway Jersey barriers."""
     runs = json.loads((C.BUILD / "road_levels.json").read_text())
     types = json.loads((C.BUILD / "road_types.json").read_text())
@@ -1409,35 +1573,40 @@ def build_structures(od, dem, top_z, paved_all):
                             break
                 elif lv == "tunnel":
                     st["tunnel_runs"] += 1
+                    # clear height: TUNNEL_H, less where a road of the level above runs closer than ceiling + roof
+                    Pm = r.xyz(s, (tl + tr) / 2)
+                    hr = np.minimum.reduce([headroom(lane_idx, Q[:, :2], zc) for Q in (PL, PR, Pm)])
+                    TH = np.clip(hr - TUNNEL_ROOF - 0.05, TUNNEL_MIN_H, TUNNEL_H)
+                    st["tunnel_lowered_m"] += int(np.sum(TH < TUNNEL_H - 1e-6) * np.mean(np.diff(s)))
                     for P, adj, sgn in ((PL, adjL, 1.0), (PR, adjR, -1.0)):
                         for i0, i1 in _true_runs(~adj):
                             sl = slice(i0, i1 + 1)
                             # glazed tile up to TILE_H, grimy concrete above (faces inwards)
                             wall_band("Wall__TunnelTile", P[sl], P[sl, 2] + TILE_H, -sgn * nl[sl])
                             Pu = P[sl].copy(); Pu[:, 2] += TILE_H
-                            wall_band("Wall__TunnelCeil", Pu, zc[sl] + TUNNEL_H, -sgn * nl[sl])
-                    Cl, Cr = PL.copy(), PR.copy(); Cl[:, 2] = zc + TUNNEL_H; Cr[:, 2] = zc + TUNNEL_H
+                            wall_band("Wall__TunnelCeil", Pu, zc[sl] + TH[sl], -sgn * nl[sl])
+                    Cl, Cr = PL.copy(), PR.copy(); Cl[:, 2] = zc + TH; Cr[:, 2] = zc + TH
                     oriented_strip("Wall__TunnelCeil", Cl, Cr, np.tile([0, 0, -1.0], (len(s), 1)))   # ceiling
                     # ceiling light fittings every LIGHT_SPACING m on the tunnel axis (emissive; UE adds lights)
-                    Pm = r.xyz(s, (tl + tr) / 2)
                     run = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(Pm[:, :2], axis=0).T))])
                     for d_ in np.arange(LIGHT_SPACING / 2, run[-1], LIGHT_SPACING):
                         k = int(np.clip(np.searchsorted(run, d_), 0, len(s) - 1))
                         ex = np.array([-math.sin(h[k]), math.cos(h[k])]); ey = np.array([math.cos(h[k]), math.sin(h[k])])
-                        z1 = zc[k] + TUNNEL_H - 0.02; z0 = z1 - 0.12
+                        z1 = zc[k] + TH[k] - 0.02; z0 = z1 - 0.12
                         box("Wall__TunnelLight", Pm[k, :2], ex, ey, 0.22, 0.75, z0, z1)
                         bot = np.array([[*(Pm[k, :2] + sx * 0.22 * ex + sy * 0.75 * ey), z0] for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
                         oriented_strip("Wall__TunnelLight", bot[[0, 1]], bot[[3, 2]], np.array([[0, 0, -1.0], [0, 0, -1.0]]))
                         TUNNEL_LIGHTS.append([float(Pm[k, 0]), float(Pm[k, 1]), float(z0 - 0.05), float(h[k])])
                         st["tunnel_lights"] += 1
-                    Tl, Tr = Cl.copy(), Cr.copy(); Tl[:, 2] += 0.6; Tr[:, 2] += 0.6
+                    Tl, Tr = Cl.copy(), Cr.copy(); Tl[:, 2] += TUNNEL_ROOF; Tr[:, 2] += TUNNEL_ROOF
                     oriented_strip("Wall__Struct", Tl, Tr, np.tile([0, 0, 1.0], (len(s), 1)))    # roof slab
                 else:   # freeway at ground level / in a trench: Jersey barriers on exposed edges
                     for P, ztop, adj, sgn in ((PL, zl, adjL, 1.0), (PR, zr, adjR, -1.0)):
                         for i0, i1 in _true_runs(~adj):
                             sl = slice(i0, i1 + 1)
-                            outer = P[sl].copy(); outer[:, :2] += sgn * nl[sl, :2] * 0.05; outer[:, 2] -= 0.05
-                            inner = outer.copy(); inner[:, :2] -= sgn * nl[sl, :2] * JERSEY_W
+                            # entirely outside the carriageway edge (inner face 5 cm out), not on the outer lane
+                            inner = P[sl].copy(); inner[:, :2] += sgn * nl[sl, :2] * 0.05; inner[:, 2] -= 0.05
+                            outer = inner.copy(); outer[:, :2] += sgn * nl[sl, :2] * JERSEY_W
                             wall_band("GuardRail__Struct", outer, ztop[sl] + JERSEY_H, sgn * nl[sl])
                             wall_band("GuardRail__Struct", inner, ztop[sl] + JERSEY_H, -sgn * nl[sl])
                             oriented_strip("GuardRail__Struct", np.column_stack([outer[:, :2], ztop[sl] + JERSEY_H]),
@@ -1552,17 +1721,21 @@ def main():
     od = OpenDrive(C.XODR_FILE)
     print(f"roads {len(od.roads)}  junctions {len(od.junctions)}")
     drive_polys, walk_polys, jdrive, dpts, wpts = build_roads(od)
+    net_file = C.NET_FILE if C.XODR_SOURCE == "sumo" else None   # OdrForge: no SUMO net
     all_drive, walk_u, road_patch, corner_u, zroad, zwalk = build_junctions(
-        od, C.NET_FILE, drive_polys, walk_polys, jdrive, dpts, wpts)
-    # pull overlapping connecting lanes towards one shared junction surface (capped, C1)
-    if "--no-harmonize" not in sys.argv and not getattr(main, "_done", False):
+        od, net_file, drive_polys, walk_polys, jdrive, dpts, wpts)
+    # pull overlapping connecting lanes towards one shared junction surface (capped, C1). SUMO only: OdrForge
+    # already gives each junction one surface, and its OpenDRIVE is used as written
+    if (net_file is not None and "--no-harmonize" not in sys.argv
+            and not getattr(main, "_done", False)):
         k = harmonize_junction_elevation(od, zroad)
         print(f"harmonized elevation of {k} connecting roads -> rebuilding from updated xodr")
         main._done = True
         LAYERS.clear(); JUNCTION_REF.clear(); DRIVE_OWNER.clear()
         DRIVE_P3.clear(); WALK_P3.clear(); JREF_BY.clear()
         return main()
-    ncw = build_crosswalks(C.NET_FILE, zroad)       # first: stop bars are placed clear of them
+    # first: stop bars are placed clear of them
+    ncw = build_crosswalks(C.NET_FILE, zroad) if net_file is not None else build_crosswalks_xodr(od, zroad)
     build_markings(od)
     print(f"crosswalks {ncw}")
     fstats, road_z = finalize_surfaces()
@@ -1587,16 +1760,17 @@ def main():
     # bridges / tunnels / freeway barriers
     # surface at the same level as zref (within 1 m) next to a structure edge, NaN if none
     top_z = lambda Q, zr: np.fmax(road_z(Q, "near", zref=zr, tol=1.0), walk_z(Q, "near", zref=zr, tol=1.0))
-    sstats, ground_paved = build_structures(od, dem, top_z, paved)
+    lanes = lane_pieces(od)
+    sstats, ground_paved = build_structures(od, dem, top_z, paved, lanes)
     print("structures:", sstats)
     runs = json.loads((C.BUILD / "road_levels.json").read_text())
     tunnel_fp = structure_footprints(od, runs, ("tunnel",))
     wall = LAYERS["Wall__Struct"].arrays()
     roof_z = MeshZ(wall[0], wall[1]) if wall is not None else (lambda Q, how="max": np.full(len(Q), np.nan))
     paved_pts = np.concatenate([dpts, wpts])
-    nt = build_terrain(dem, extent, paved, paved_pts, tunnel_fp, lambda Q: roof_z(Q, "max"))
-    print("terrain tris", nt)
-    bstats = build_buildings(Dem(C.DEM_UTM, filt=5), extent, ground_paved)
+    nt = build_terrain(dem, extent, paved, paved_pts, tunnel_fp, lambda Q: roof_z(Q, "max"), lanes)
+    print("terrain tris", nt, "| at vehicle lanes:", LANE_TERRAIN)
+    bstats = build_buildings(Dem(C.DEM_UTM, filt=5), extent, ground_paved, lanes)
     print("buildings", bstats)
     summary = export(extent)
     meta = json.loads(C.META_FILE.read_text()) if C.META_FILE.exists() else {}

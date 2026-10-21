@@ -288,5 +288,7 @@ class OpenDrive:
         self.header = root.find("header")
         self.roads = [Road(r) for r in root.findall("road")]
         self.by_id = {r.id: r for r in self.roads}
-        self.junctions = {j.get("id"): j.get("name", j.get("id")) for j in root.findall("junction")}
+        # junction id -> name (SUMO: its junction id); an empty name (OdrForge) falls back to the id, so junctions
+        # never share a key
+        self.junctions = {j.get("id"): (j.get("name") or j.get("id")) for j in root.findall("junction")}
 

@@ -53,6 +53,31 @@ def dem_sampler():
     return f
 
 
+LANE_CLEAR = 0.5        # m kept free between a trunk and the edge of any vehicle lane
+LOW_CROWN = 4.5         # m: a crown starting below this hangs into traffic -> keep the whole crown off the lanes
+LEVEL_DZ = 4.0          # m: a lane this far above / below the tree base is another level (bridge, tunnel)
+
+
+def lane_areas():
+    """Vehicle lanes of the OpenDRIVE (03's lane_pieces: STRtree, mean z) for the same-level test.
+    The road mesh alone is not enough: a trunk within 0.5 m of its edge still stands in the outer lane."""
+    from opendrive import OpenDrive
+    tree, _, zs = GB.lane_pieces(OpenDrive(C.XODR_FILE))
+    return tree, zs
+
+
+def on_lane(tree, zs, xy, zb, clear):
+    """True where the point lies within clear (per point) of a vehicle lane at its own level."""
+    pts = shapely.points(xy)
+    hit = np.zeros(len(xy), bool)
+    for i, (p, c) in enumerate(zip(pts, clear)):
+        for k in tree.query(p, predicate="dwithin", distance=c):
+            if abs(zs[k] - zb[i]) < LEVEL_DZ:
+                hit[i] = True
+                break
+    return hit
+
+
 def canopy_height_model(extent, dem):
     p = np.load(C.DATA / "lidar" / "points.npz")
     tf = Transformer.from_crs(3857, C.MAP_PROJ, always_xy=True)
@@ -180,9 +205,11 @@ def main():
 
     T, radius = detect_trees(chm, canopy, tr)
     shapely.prepare(road)
+    lanes, lane_z = lane_areas()
     trees = []
     on_road = shapely.contains_xy(road.buffer(-0.5), T[:, 0], T[:, 1])
     base = zsurf(T[:, :2])
+    n_lane = 0
     for (x, y, h), r, rd, zb in zip(T, radius, on_road, base):
         if rd or np.isnan(zb) or h > 35:   # over a driving lane / not a tree (structures)
             continue
@@ -202,6 +229,10 @@ def main():
             sp = "broadleaf_m"
         else:
             sp = "broadleaf_l"
+        clear = r if (crown_base < LOW_CROWN and sp != "palm") else LANE_CLEAR
+        if on_lane(lanes, lane_z, np.array([[x, y]]), np.array([zb]), [clear])[0]:
+            n_lane += 1       # trunk (or a low crown) in a vehicle lane
+            continue
         trees.append(dict(x=round(float(x), 2), y=round(float(y), 2), z=round(float(zb), 3), height=round(float(h), 2),
                           radius=round(r, 2), crown_base=round(crown_base, 2), species=sp,
                           yaw=round(float(rng.uniform(0, 360)), 1),
@@ -222,8 +253,10 @@ def main():
         tp = np.array(taken)
         zb = zsurf(tp)
         hh = sp_h[cKDTree(sp_xy).query(tp)[1]]
-        for p, z, hv in zip(tp, zb, hh):
-            if not np.isnan(z):
+        lane_hit = on_lane(lanes, lane_z, tp, zb, np.maximum(0.5, 0.6 * hh))   # a shrub's crown is its body
+        n_lane += int(lane_hit.sum())
+        for p, z, hv, lh in zip(tp, zb, hh, lane_hit):
+            if not np.isnan(z) and not lh:
                 shrubs.append(dict(x=round(float(p[0]), 2), y=round(float(p[1]), 2), z=round(float(z), 3),
                                    height=round(float(hv), 2), radius=round(float(max(0.5, 0.6 * hv)), 2),
                                    species="shrub", yaw=round(float(rng.uniform(0, 360)), 1), variant=int(rng.integers(0, 4))))
@@ -262,6 +295,7 @@ def main():
     print("trees:", len(trees), dict(Counter(t["species"] for t in trees)))
     print("tree height p10/p50/p90:", np.percentile([t["height"] for t in trees], [10, 50, 90]).round(1) if trees else "-")
     print("shrubs:", len(shrubs), "| grass patches:", n_patch, f"({gu.area:.0f} m2)")
+    print("dropped from vehicle lanes (OpenDRIVE, same level):", n_lane)
 
     # debug image
     img = np.zeros((H, W, 3), np.uint8)

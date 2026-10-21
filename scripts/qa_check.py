@@ -134,10 +134,14 @@ for r in od.roads:
                 narrow.append((r.id, l.id, l.type, round(float(w.min()), 2)))
             if w.min() < -1e-3:
                 narrow.append((r.id, l.id, l.type, "NEGATIVE", round(float(w.min()), 3)))
-        if i:   # width jump at section border for lanes continuing with same id
+        if i:   # width jump at section border for continuing lanes: the lane's predecessor link, else same id
             prev = r.sections[i - 1]
+            sec_el = r.el.find("lanes").findall("laneSection")[i]
+            pred = {int(e.get("id")): int(e.find("link/predecessor").get("id"))
+                    for e in sec_el.iter("lane") if e.find("link/predecessor") is not None}
             for l in sec.left + sec.right:
-                pl = next((p for p in prev.left + prev.right if p.id == l.id), None)
+                pid = pred.get(l.id, l.id)
+                pl = next((p for p in prev.left + prev.right if p.id == pid), None)
                 if pl is None:
                     continue
                 w0 = float(pl.width(np.array([sec.s - prev.s]))[0]); w1 = float(l.width(np.array([0.0]))[0])
@@ -150,7 +154,8 @@ badlinks = []
 root = od.tree.getroot()
 for rel in root.findall("road"):
     rid = rel.get("id")
-    for sec in rel.find("lanes").findall("laneSection"):
+    secs = rel.find("lanes").findall("laneSection")
+    for k, sec in enumerate(secs):
         for ln in sec.iter("lane"):
             lk = ln.find("link")
             if lk is None:
@@ -158,6 +163,12 @@ for rel in root.findall("road"):
             for kind in ("predecessor", "successor"):
                 e = lk.find(kind)
                 if e is None:
+                    continue
+                # links between sections of the same road point into the neighbouring section
+                nb = k - 1 if kind == "predecessor" else k + 1
+                if 0 <= nb < len(secs):
+                    if e.get("id") not in {l.get("id") for l in secs[nb].iter("lane")}:
+                        badlinks.append((rid, ln.get("id"), kind, "target lane missing in next section", e.get("id")))
                     continue
                 link = rel.find("link").find(kind) if rel.find("link") is not None else None
                 if link is None:
@@ -393,6 +404,22 @@ if len(SF_):
 else:
     lanes_hit = []
 section("O  bridge piers standing on a roadway (x, y)", lanes_hit, str)
+
+# nothing but road surface and paint in the space a car occupies on a driving lane (clearance.py)
+import clearance
+probes = clearance.lane_probes(od)
+arrays = {k: g[k] for k in g.files}
+fg = C.BUILD / "furniture_geom.npz"
+if fg.exists():
+    f_ = np.load(fg)
+    arrays.update({k: f_[k] for k in f_.files})
+obst = clearance.obstructions(probes, clearance.layer_triangles(arrays))
+anyhit = np.any(list(obst.values()), 0) if obst else np.zeros(len(probes), bool)
+REPORT["P_probes"] = int(len(probes))
+REPORT["P_by_layer"] = {k: int(v.sum()) for k, v in obst.items() if v.any()}
+print(f"   {len(probes)} driving-lane probes; by layer:", REPORT["P_by_layer"])
+section("P  obstructions in driving lanes (x, y, z, in_junction)",
+        [(round(float(p[0]), 1), round(float(p[1]), 1), round(float(p[2]), 1), bool(p[4])) for p in probes[anyhit]], str)
 
 json.dump(REPORT, open(C.BUILD / "qa_report.json", "w"), indent=1, default=str)
 print("\nreport:", C.BUILD / "qa_report.json")

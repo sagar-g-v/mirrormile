@@ -26,8 +26,11 @@ MAP = "LA_DTLA"
 EXPORT = f"{PIPE}/export/{MAP}"
 TEX = f"{PIPE}/textures"
 META = json.load(open(f"{PIPE}/build/meta.json"))
+# name of the map inside CARLA (level, mesh folders, OpenDRIVE copy, weather): another name keeps an existing
+# LA_DTLA build untouched, e.g. OSM2CARLA_UE_MAP=LA_DTLA_ODR for the OdrForge road network next to the SUMO one
+UE_MAP = os.environ.get("OSM2CARLA_UE_MAP", MAP)
 
-MAP_DIR = f"/Game/Carla/Maps/{MAP}"
+MAP_DIR = f"/Game/Carla/Maps/{UE_MAP}"
 MAT_DIR = f"{MAP_DIR}/Materials"
 TEX_DIR = f"{MAP_DIR}/Textures"
 LABELS = ["Road", "RoadLine", "SideWalk", "Terrain", "Building", "Vegetation", "Bridge", "GuardRail", "Wall",
@@ -36,7 +39,7 @@ LABELS = ["Road", "RoadLine", "SideWalk", "Terrain", "Building", "Vegetation", "
 # signals, so they are controllable and drive the Traffic Manager) + CARLA streetlight assets at the
 # 03e positions; False = import the static preview meshes (Pole / TrafficLight / TrafficSign FBX)
 CARLA_PROPS = True
-REIMPORT = False         # True: re-import every FBX even if the label folder already holds the meshes
+REIMPORT = os.environ.get("OSM2CARLA_REIMPORT") == "1"   # re-import every FBX even if the label folder holds the meshes
 if not CARLA_PROPS:                  # static stand-ins for CARLA's traffic lights / stop signs / streetlights
     LABELS += ["Pole_Preview", "TrafficLight_Preview", "TrafficSign_Preview"]
 STREETLIGHT_NAMES = ("StreetLight", "Streetlight", "Street_Light", "StreetLamp", "Lamppost", "LampPost")
@@ -130,6 +133,37 @@ def warn_once(what, ex):
 
 
 SMES = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+
+
+class HeadlessPlacer:
+    """EditorActorSubsystem for headless runs (UnrealEditor-Cmd -run=pythonscript): its spawn_actor_from_* place
+    through the level-editor viewport, which a commandlet does not have (access violation in
+    PlaceAssetInCurrentLevel: the placement factories register on OnPostEngineInit, which a commandlet never
+    reaches). This spawns straight into the editor world with CARLA's static helper (World->SpawnActor);
+    everything else is the subsystem's."""
+
+    def __init__(self, eas):
+        self.eas = eas
+
+    def __getattr__(self, name):
+        return getattr(self.eas, name)
+
+    def spawn_actor_from_class(self, cls, loc, rot=None):
+        tf = unreal.Transform(loc, rot or unreal.Rotator(0, 0, 0), unreal.Vector(1, 1, 1))
+        return unreal.OpenDriveToMap.spawn_actor_with_check_no_collisions(cls, tf)
+
+    def spawn_actor_from_object(self, obj, loc, rot=None):
+        if isinstance(obj, unreal.StaticMesh):
+            a = self.spawn_actor_from_class(unreal.StaticMeshActor, loc, rot)
+            a.static_mesh_component.set_static_mesh(obj)
+            return a
+        return self.spawn_actor_from_class(obj, loc, rot)
+
+
+def actor_subsystem():
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    headless = "-run=pythonscript" in unreal.SystemLibrary.get_command_line().lower()
+    return HeadlessPlacer(eas) if headless else eas
 
 
 def guarded(name, fn, *args):
@@ -488,7 +522,7 @@ def import_meshes(mis):
         fbx = f"{EXPORT}/{MAP}_{label}.fbx"
         if not os.path.exists(fbx):
             continue
-        dest = f"/Game/Carla/Static/{label.split('_')[0]}/{MAP}"   # folder name drives CARLA semantic tags
+        dest = f"/Game/Carla/Static/{label.split('_')[0]}/{UE_MAP}"   # folder name drives CARLA semantic tags
         if not REIMPORT and EAL.does_directory_exist(dest) and EAL.list_assets(dest, recursive=False):
             objs = [unreal.load_asset(p) for p in EAL.list_assets(dest, recursive=False)
                     if f"SM_{MAP}_{label}_" in p.split("/")[-1].split(".")[0]]
@@ -582,9 +616,9 @@ def build_level(meshes):
     """Create (or open) the map /Game/Carla/Maps/LA_DTLA/LA_DTLA as its own level, from CARLA's BaseMap
     template (sky, weather, CARLA game mode). new_level_from_template creates, saves and opens it in
     one step; duplicating BaseMap and loading the unsaved copy crashes the editor (world leak)."""
-    level_path = f"{MAP_DIR}/{MAP}"
+    level_path = f"{MAP_DIR}/{UE_MAP}"
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
-    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    eas = actor_subsystem()
     if EAL.does_asset_exist(level_path):
         les.load_level(level_path)
         log("opened existing map", level_path)
@@ -866,21 +900,21 @@ def register_weather():
     cdo = unreal.get_default_object(bp.generated_class())
     dw = cdo.get_editor_property("DefaultWeathers")
     keys = [str(k) for k in dw.keys()]
-    if MAP in keys:
-        log("weather: default weather for", MAP, "already registered"); return
+    if UE_MAP in keys:
+        log("weather: default weather for", UE_MAP, "already registered"); return
     if WEATHER_TEMPLATE_MAP not in keys:
         log("weather: template", WEATHER_TEMPLATE_MAP, "not in DefaultWeathers:", ", ".join(keys)); return
-    dw[MAP] = dw[WEATHER_TEMPLATE_MAP]
+    dw[UE_MAP] = dw[WEATHER_TEMPLATE_MAP]
     cdo.set_editor_property("DefaultWeathers", dw)
     EAL.save_loaded_asset(bp, only_if_is_dirty=False)
-    log("weather: registered", MAP, "default weather (copy of", WEATHER_TEMPLATE_MAP + ")")
+    log("weather: registered", UE_MAP, "default weather (copy of", WEATHER_TEMPLATE_MAP + ")")
 
 
 def sky_only():
     """Apply only the sky / lighting stage to the existing map (OSM2CARLA_STAGE=sky)."""
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
-    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-    les.load_level(f"{MAP_DIR}/{MAP}")
+    eas = actor_subsystem()
+    les.load_level(f"{MAP_DIR}/{UE_MAP}")
     guarded("register_weather", register_weather)
     guarded("setup_sky", setup_sky, eas)
     les.save_current_level()
@@ -890,17 +924,17 @@ def sky_only():
 def copy_xodr():
     content = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())
     src = f"{EXPORT}/{MAP}.xodr"
-    for d in (f"{content}Carla/Maps/{MAP}/OpenDrive", f"{content}Carla/Maps/OpenDrive"):
+    for d in (f"{content}Carla/Maps/{UE_MAP}/OpenDrive", f"{content}Carla/Maps/OpenDrive"):
         os.makedirs(d, exist_ok=True)
-        shutil.copy2(src, f"{d}/{MAP}.xodr")
+        shutil.copy2(src, f"{d}/{UE_MAP}.xodr")
         log("xodr ->", d)
     # camera post-process profile: CARLA cameras load Config/PostProcess/<map>.json, else Default.json
     # (fixed manual exposure -> black images under BP_Carla_Sky). Town10's profile uses histogram
     # auto-exposure and matches the sky rig copied from Town10 (setup_sky)
     pp = f"{content}Carla/Config/PostProcess"
     if os.path.exists(f"{pp}/Town10HD_Opt.json"):
-        shutil.copy2(f"{pp}/Town10HD_Opt.json", f"{pp}/{MAP}.json")
-        log("camera post-process profile ->", f"{pp}/{MAP}.json")
+        shutil.copy2(f"{pp}/Town10HD_Opt.json", f"{pp}/{UE_MAP}.json")
+        log("camera post-process profile ->", f"{pp}/{UE_MAP}.json")
 
 
 def main():
@@ -909,15 +943,15 @@ def main():
     meshes = import_meshes(mis)
     copy_xodr()                      # before the level: CARLA's signal generator reads it
     lvl = build_level(meshes)
-    log("DONE. Open", lvl, "and press Play, or client.load_world('" + MAP + "')")
+    log("DONE. Open", lvl, "and press Play, or client.load_world('" + UE_MAP + "')")
 
 
 def lights_only():
     """Re-apply night light levels to the existing map (OSM2CARLA_STAGE=lights; run headless):
     streetlight intensity, shop lights (re-placed, tagged NightLight), lit-window strength."""
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
-    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-    les.load_level(f"{MAP_DIR}/{MAP}")
+    eas = actor_subsystem()
+    les.load_level(f"{MAP_DIR}/{UE_MAP}")
     n = 0
     for a in eas.get_all_level_actors():
         if a.get_actor_label().startswith(f"SL_{MAP}_") and CARLA_LIGHT_CLASS:
