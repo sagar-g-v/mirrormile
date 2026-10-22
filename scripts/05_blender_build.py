@@ -263,13 +263,12 @@ def weld(ob, dist=0.002):
 def decimate_terrain(ob):
     """Planar dissolve (keeps silhouettes, removes flat interior triangles), then triangulate."""
     n0 = len(ob.data.polygons)
-    mod = ob.modifiers.new("planar", "DECIMATE")
-    mod.decimate_type = "DISSOLVE"; mod.angle_limit = math.radians(1.0)
-    mod.delimit = {"UV"} if False else {"NORMAL"}
-    tri = ob.modifiers.new("tri", "TRIANGULATE"); tri.quad_method = "BEAUTY"; tri.ngon_method = "BEAUTY"
-    bpy.context.view_layer.objects.active = ob
-    for m in (mod, tri):
-        bpy.ops.object.modifier_apply(modifier=m.name)
+    # the decimate (planar) and triangulate modifiers' own operations, on the mesh directly (applying the
+    # modifiers through operators cost ~0.5 s per terrain tile)
+    bm = bmesh.new(); bm.from_mesh(ob.data)
+    bmesh.ops.dissolve_limit(bm, angle_limit=math.radians(1.0), verts=bm.verts, edges=bm.edges, delimit={"NORMAL"})
+    bmesh.ops.triangulate(bm, faces=bm.faces, quad_method="BEAUTY", ngon_method="BEAUTY")
+    bm.to_mesh(ob.data); bm.free()
     return n0, len(ob.data.polygons)
 
 
@@ -277,12 +276,12 @@ def join(objs, name):
     if len(objs) == 1:
         objs[0].name = name; objs[0].data.name = name
         return objs[0]
-    bpy.ops.object.select_all(action="DESELECT")
-    for o in objs:
-        o.select_set(True)
-    bpy.context.view_layer.objects.active = objs[0]
-    bpy.ops.object.join()
-    ob = bpy.context.view_layer.objects.active
+    # the join operator on exactly these objects (a context override; deselecting the whole scene before each
+    # of ~1100 joins made them slow as the scene grew)
+    with bpy.context.temp_override(active_object=objs[0], object=objs[0], selected_objects=objs,
+                                   selected_editable_objects=objs):
+        bpy.ops.object.join()
+    ob = objs[0]
     ob.name = name; ob.data.name = name
     return ob
 
