@@ -24,6 +24,7 @@ import config as C
 from opendrive import OpenDrive, eval_geometry
 
 GB = importlib.import_module("03_build_geometry")
+import geom_par as GP
 
 ROAD_TYPES = {"driving", "restricted", "parking", "bidirectional", "biking", "bus", "taxi", "HOV",
               "entry", "exit", "onRamp", "offRamp", "connectingRamp", "shoulder", "stop", "border"}
@@ -250,8 +251,20 @@ section("F2 surface triangles facing down/steep (layer, count, examples)", down,
 # road surface polygon and boundary edges
 ra, _ = tri_area_normal(RV, RF)
 rpolys = shapely.polygons(RV[RF][:, :, :2])
-road_u = shapely.union_all(rpolys[ra > 1e-6], grid_size=1e-3)
-walk_u = shapely.union_all(shapely.polygons(SV[SF][:, :, :2]), grid_size=1e-3)
+# the whole-map unions and buffers run side by side on worker threads (GEOS releases the GIL): the same calls
+# on the same inputs as one after another, so the same results (~3 min of them in a row before)
+dem_ = GB.Dem(C.DEM_UTM, filt=3)
+rc0 = RV[RF].mean(1)
+ground_tri_ok = (np.abs(rc0[:, 2] - dem_(rc0[:, 0], rc0[:, 1])) < 2.0) & (ra > 1e-6)   # ground-level asphalt
+f_road = GP.submit(shapely.union_all, rpolys[ra > 1e-6], grid_size=1e-3)
+f_walk = GP.submit(shapely.union_all, shapely.polygons(SV[SF][:, :, :2]), grid_size=1e-3)
+f_bld = GP.submit(shapely.union_all, shapely.polygons(BV[BF][:, :, :2])[tri_area_normal(BV, BF)[1][:, 2] > 0.9],
+                  grid_size=1e-3)
+f_ground = GP.submit(shapely.union_all, rpolys[ground_tri_ok], grid_size=1e-3)
+f_ground_02 = GP.submit(lambda: f_ground.result().buffer(-0.2))
+f_ground_03 = GP.submit(lambda: f_ground.result().buffer(-0.3))
+road_u, walk_u = f_road.result(), f_walk.result()
+f_pin = GP.submit(lambda: shapely.union_all([road_u, walk_u], grid_size=1e-3).buffer(-0.05))
 edges = np.sort(np.concatenate([RF[:, [0, 1]], RF[:, [1, 2]], RF[:, [2, 0]]]), axis=1)
 ue, cnt = np.unique(edges, axis=0, return_counts=True)
 bnd = ue[cnt == 1]
@@ -314,11 +327,9 @@ steps.sort(key=lambda s: -s[2])
 section("I  height steps > 1 cm between coincident road vertices (x, y, dz)", steps, str)
 
 # terrain poking through paved areas
-paved = shapely.union_all([road_u, walk_u], grid_size=1e-3)
-pin = paved.buffer(-0.05)
+pin = f_pin.result()                      # union of road and sidewalk, 5 cm in
 shapely.prepare(pin)
 surf = np.concatenate([RV, SV])
-dem_ = GB.Dem(C.DEM_UTM, filt=3)
 surf = surf[np.abs(surf[:, 2] - dem_(surf[:, 0], surf[:, 1])) < 2.0]   # ground-level pavement only
 st = cKDTree(surf[:, :2])
 tin = shapely.contains_xy(pin, TV[:, 0], TV[:, 1])
@@ -360,10 +371,8 @@ print("   curb height percentiles 1/5/50/95/99 % (cm):", REPORT["L_curb_height_s
 section("L  curb height outside 10-20 cm (x, y, height m)", badc, str)
 
 # buildings intersecting the roadway
-bpolys = shapely.union_all(shapely.polygons(BV[BF][:, :, :2])[tri_area_normal(BV, BF)[1][:, 2] > 0.9], grid_size=1e-3)
-rc0 = RV[RF].mean(1)
-ground_road = shapely.union_all(rpolys[(np.abs(rc0[:, 2] - dem_(rc0[:, 0], rc0[:, 1])) < 2.0) & (ra > 1e-6)], grid_size=1e-3)
-ov = bpolys.intersection(ground_road.buffer(-0.2))      # roads in tunnels under buildings are fine
+bpolys = f_bld.result()
+ov = bpolys.intersection(f_ground_02.result())      # ground-level roads 20 cm in: roads in tunnels under buildings are fine
 section("M  building footprint on the roadway (m2)", [round(ov.area, 2)] if ov.area > 0.5 else [], str)
 
 # vertical clearance: wherever one road surface passes over another, the space between the lower
@@ -395,9 +404,7 @@ SV_, SF_ = layer("Bridge__Pier")
 if len(SF_):
     cen = SV_[SF_].mean(1)
     low = cen[:, 2] < dem_(cen[:, 0], cen[:, 1]) + 2.0              # pier feet
-    rc = RV[RF].mean(1)
-    ground_tri = np.abs(rc[:, 2] - dem_(rc[:, 0], rc[:, 1])) < 2.0      # ground-level asphalt only
-    road_poly = shapely.union_all(rpolys[ground_tri & (ra > 1e-6)], grid_size=1e-3).buffer(-0.3)
+    road_poly = f_ground_03.result()    # ground-level asphalt only (the same union as the M check), 30 cm in
     shapely.prepare(road_poly)
     feet_in = cen[low][shapely.contains_xy(road_poly, cen[low, 0], cen[low, 1])]
     lanes_hit = [tuple(np.round(p[:2], 1).tolist()) for p in feet_in]
