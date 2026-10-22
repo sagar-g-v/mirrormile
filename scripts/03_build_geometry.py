@@ -29,11 +29,28 @@ def polys_only(g):
     return shapely.union_all(parts, grid_size=1e-3) if parts else Polygon()
 
 
+UNION_TILES = 16      # large unions: 16 x 16 tiles by centroid, then the tiles (whole-map unions of ~650k
+UNION_TILED_FROM = 20000   # triangles took 60-160 s and fell back to the 5 mm buffer pass; tiled: ~30 s)
+
+
 def robust_union(polys, grid=1e-2):
     """Union of many (possibly degenerate) triangles: grid-snapped union, falling back to repaired
-    geometry and finally a tiny buffer when GEOS reports a topology exception."""
+    geometry and finally a tiny buffer when GEOS reports a topology exception. Large inputs are united
+    tile by tile (same fallbacks per tile), then the tiles."""
     polys = np.asarray(polys, dtype=object)
     polys = polys[~shapely.is_empty(polys)] if len(polys) else polys
+    if len(polys) >= UNION_TILED_FROM:
+        c = shapely.centroid(polys)
+        x, y = shapely.get_x(c), shapely.get_y(c)
+        ix = np.minimum((UNION_TILES * (x - x.min()) / max(np.ptp(x), 1e-9)).astype(int), UNION_TILES - 1)
+        iy = np.minimum((UNION_TILES * (y - y.min()) / max(np.ptp(y), 1e-9)).astype(int), UNION_TILES - 1)
+        key = ix * UNION_TILES + iy
+        parts = [_union_with_fallbacks(polys[key == k], grid) for k in np.unique(key)]
+        return _union_with_fallbacks(np.asarray(parts, dtype=object), grid)
+    return _union_with_fallbacks(polys, grid)
+
+
+def _union_with_fallbacks(polys, grid):
     try:
         return shapely.union_all(polys, grid_size=grid)
     except shapely.errors.GEOSException:
@@ -1083,6 +1100,9 @@ def build_buildings(dem, extent, paved, lanes=None):
     part_tree = shapely.STRtree([p for p, _ in parts]) if parts else None
     stats = defaultdict(int)
     tiers_all = load_building_tiers()
+    # the paved area grown by 5 cm, once (buffering the whole map's paving per building took ~40 min)
+    paved_off = paved.buffer(0.05)
+    shapely.prepare(paved)
     for raw, tags in polys:
         if is_underground(tags):
             stats["underground_skipped"] += 1
@@ -1109,7 +1129,7 @@ def build_buildings(dem, extent, paved, lanes=None):
         if tags.get("building") in ("roof", "carport", "canopy") and not minh:
             minh = max(0.0, h - 1.0)
         # keep buildings off the street (OSM footprints sometimes overlap the curb)
-        poly = poly.difference(paved.buffer(0.05)) if poly.intersects(paved) else poly
+        poly = poly.difference(paved_off) if poly.intersects(paved) else poly
         pieces = []
         for g in shapely.get_parts(poly):
             if g.geom_type != "Polygon" or g.area < 4:
