@@ -33,6 +33,7 @@ from scipy.ndimage import binary_opening, gaussian_filter, gaussian_filter1d, me
 import config as C
 import importlib
 GB = importlib.import_module("03_build_geometry")
+import geom_par as GP
 
 RES = 0.5
 MIN_COVER = 0.60          # fraction of footprint cells with a roof return
@@ -47,8 +48,7 @@ NEAR = 7.0                # m: footprint-to-lidar misregistration allowance next
 
 def lidar_surface(extent, dem):
     p = np.load(C.DATA / "lidar" / "points.npz")
-    tf = Transformer.from_crs(3857, C.MAP_PROJ, always_xy=True)
-    x, y = tf.transform(p["x"], p["y"])
+    x, y = GP.transform_xy(3857, C.MAP_PROJ, p["x"], p["y"])     # ~100M points, on the threads
     z, cls = p["z"].astype(np.float64), p["cls"]
     keep = (cls != 7) & (cls != 18) & (cls != 17)
     x, y, z, cls = x[keep], y[keep], z[keep], cls[keep]

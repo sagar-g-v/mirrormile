@@ -8,6 +8,7 @@ Outputs
 """
 import json
 import math
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -46,9 +47,12 @@ def dem_sampler():
     with rasterio.open(C.DEM_UTM) as src:
         d = src.read(1).astype(np.float64); inv = ~src.transform
     d[d < -1000] = np.nanmedian(np.where(d < -1000, np.nan, d))
-    tf = Transformer.from_crs(C.MAP_PROJ, C.UTM_EPSG, always_xy=True)
+    local = threading.local()          # a Transformer per thread (they are not thread-safe)
 
     def f(x, y):
+        tf = getattr(local, "tf", None)
+        if tf is None:
+            tf = local.tf = Transformer.from_crs(C.MAP_PROJ, C.UTM_EPSG, always_xy=True)
         ux, uy = tf.transform(np.asarray(x, float), np.asarray(y, float))
         c, r = inv * (np.asarray(ux), np.asarray(uy))
         return map_coordinates(d, [np.asarray(r) - 0.5, np.asarray(c) - 0.5], order=1, mode="nearest")
@@ -82,15 +86,14 @@ def on_lane(tree, zs, xy, zb, clear):
 
 def canopy_height_model(extent, dem):
     p = np.load(C.DATA / "lidar" / "points.npz")
-    tf = Transformer.from_crs(3857, C.MAP_PROJ, always_xy=True)
-    x, y = tf.transform(p["x"], p["y"])
+    x, y = GP.transform_xy(3857, C.MAP_PROJ, p["x"], p["y"])     # ~100M points, on the threads
     z, cls = p["z"].astype(np.float64), p["cls"]
     keep = (cls != 7) & (cls != 18)                       # noise
     x, y, z, cls = x[keep], y[keep], z[keep], cls[keep]
     ground = cls == 2
     gi = rng.choice(np.flatnonzero(ground), size=min(200000, ground.sum()), replace=False)
     offset = float(np.median(z[gi] - dem(x[gi], y[gi])))   # lidar vertical datum vs DEM (NAVD88)
-    hag = z - offset - dem(x, y)
+    hag = z - offset - GP.pointwise(dem, x, y)                 # DEM at every point, on the threads
     print(f"lidar: {len(x):,} pts, vertical offset to DEM {offset:+.2f} m, "
           f"ground residual p95 {np.percentile(np.abs(hag[gi]), 95):.2f} m")
     tr, W, H = grid(extent)

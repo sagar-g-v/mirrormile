@@ -46,6 +46,30 @@ def submit(fn, *args, **kw):
     return p.submit(fn, *args, **kw) if p is not None else _Done(fn(*args, **kw))
 
 
+def pointwise(fn, *arrays, parts=None):
+    """fn(*arrays) for a function that works point by point (each output element depends only on the same
+    element of the inputs), the arrays cut into parts on the threads; the same values as one call."""
+    n = len(arrays[0])
+    p = pool()
+    parts = parts or WORKERS
+    if p is None or n < 200000:
+        return fn(*arrays)
+    cuts = np.linspace(0, n, parts + 1).astype(int)
+    res = list(p.map(lambda i: fn(*(a[cuts[i]:cuts[i + 1]] for a in arrays)), range(parts)))
+    if isinstance(res[0], tuple):
+        return tuple(np.concatenate(r) for r in zip(*res))
+    return np.concatenate(res)
+
+
+def transform_xy(src, dst, x, y):
+    """Transformer.from_crs(src, dst, always_xy=True).transform(x, y) for large arrays on the threads (a
+    Transformer per part: they are not thread-safe; pyproj releases the GIL). 101M lidar points: 14.5 s -> 1.5 s,
+    identical."""
+    from pyproj import Transformer
+    return pointwise(lambda a, b: Transformer.from_crs(src, dst, always_xy=True).transform(a, b),
+                     np.asarray(x), np.asarray(y))
+
+
 def union_groups(groups, grid):
     """union_with_fallbacks of each group (arrays of geometries), in parallel when there are workers."""
     p = pool()
