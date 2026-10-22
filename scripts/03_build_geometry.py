@@ -4,6 +4,7 @@ Layers are named "<CarlaLabel>__<Material>"; CarlaLabel is the CARLA semantic fo
 (Road, SideWalk, RoadLine, Terrain, Building) that the asset will be imported into.
 """
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -23,10 +24,23 @@ from shapely.geometry import Polygon, MultiPolygon, LineString
 from shapely.ops import polygonize, linemerge
 
 
+# results of the 1 mm grid union (polys_only / unary_union) by id: such a geometry is already polygonal, valid and
+# on the grid, so polys_only of it is itself - skipping the repeat saves re-uniting whole-map geometries
+_SNAPPED = {}
+
+
+def _snapped(g):
+    if shapely.get_num_coordinates(g) >= 500:    # small ones are cheap to redo; keep the cache small
+        _SNAPPED[id(g)] = g
+    return g
+
+
 def polys_only(g):
+    if _SNAPPED.get(id(g)) is g:
+        return g
     g = shapely.make_valid(g)
     parts = [p for p in shapely.get_parts(g) if p.geom_type in ("Polygon", "MultiPolygon") and not p.is_empty]
-    return shapely.union_all(parts, grid_size=1e-3) if parts else Polygon()
+    return _snapped(shapely.union_all(parts, grid_size=1e-3)) if parts else Polygon()
 
 
 UNION_TILES = 16      # large unions: 16 x 16 tiles by centroid, then the tiles (whole-map unions of ~650k
@@ -45,21 +59,9 @@ def robust_union(polys, grid=1e-2):
         ix = np.minimum((UNION_TILES * (x - x.min()) / max(np.ptp(x), 1e-9)).astype(int), UNION_TILES - 1)
         iy = np.minimum((UNION_TILES * (y - y.min()) / max(np.ptp(y), 1e-9)).astype(int), UNION_TILES - 1)
         key = ix * UNION_TILES + iy
-        parts = [_union_with_fallbacks(polys[key == k], grid) for k in np.unique(key)]
-        return _union_with_fallbacks(np.asarray(parts, dtype=object), grid)
-    return _union_with_fallbacks(polys, grid)
-
-
-def _union_with_fallbacks(polys, grid):
-    try:
-        return shapely.union_all(polys, grid_size=grid)
-    except shapely.errors.GEOSException:
-        pass
-    good = shapely.make_valid(polys)
-    try:
-        return shapely.union_all(good, grid_size=grid)
-    except shapely.errors.GEOSException:
-        return shapely.union_all(shapely.buffer(good, 0.005)).buffer(-0.005)
+        parts = geom_par.union_groups([polys[key == k] for k in np.unique(key)], grid)   # tiles in parallel
+        return geom_par.union_with_fallbacks(np.asarray(parts, dtype=object), grid)
+    return geom_par.union_with_fallbacks(polys, grid)
 
 
 def unary_union(geoms):
@@ -67,9 +69,10 @@ def unary_union(geoms):
     if not isinstance(geoms, (list, tuple)):
         geoms = [geoms]
     parts = [polys_only(g) for g in geoms if g is not None and not g.is_empty]
-    return shapely.union_all(parts, grid_size=1e-3) if parts else Polygon()
+    return _snapped(shapely.union_all(parts, grid_size=1e-3)) if parts else Polygon()
 
 import config as C
+import geom_par
 from opendrive import OpenDrive, write_elevation
 
 CURB = 0.15          # sidewalk height above road (m)
@@ -416,12 +419,21 @@ def refined_triangulate(poly, zfun, step=2.5, seg=1.5):
     D = Delaunay(pts)
     F = D.simplices
     tp = shapely.polygons(pts[F])
-    shapely.prepare(poly)
-    keep = shapely.within(tp, poly.buffer(0.01))
+    near = poly.buffer(0.01)
+    shapely.prepare(near)
+    keep = shapely.within(tp, near)
     F = F[keep]
     V = np.column_stack([pts, zfun(pts)])
     parts_V, parts_F, n = [V], [F], len(V)
-    left = poly.difference(shapely.union_all(tp[keep], grid_size=1e-4), grid_size=1e-4)
+    # Delaunay triangles do not overlap: their coverage union is far cheaper than a general union (the
+    # difference snaps it to the same 0.1 mm grid); the general union when the coverage union is not valid
+    try:
+        covered = shapely.coverage_union_all(tp[keep])
+        if not covered.is_valid:
+            raise shapely.errors.GEOSException("invalid coverage union")
+    except shapely.errors.GEOSException:      # sliver triangles: not a clean coverage
+        covered = shapely.union_all(tp[keep], grid_size=1e-4)
+    left = poly.difference(covered, grid_size=1e-4)
     for piece in shapely.get_parts(left):
         if piece.geom_type != "Polygon" or piece.area < 1e-4:
             continue
@@ -1222,25 +1234,26 @@ def fix_t_junctions(V, F, T, tol=5e-3, maxdz=0.03, iters=8):
         bE, bf, bs = E[bnd], fid[bnd], slot[bnd]
         bv = np.unique(bE)
         tree = cKDTree(V[bv, :2])
+        # every boundary edge against the boundary vertices near it, all edges at once (a loop over ~100k edges
+        # with one ball query each took ~30 s): v on edge a-b strictly inside, within tol of it, within maxdz of
+        # the edge's height there
+        pa, pb = V[bE[:, 0]], V[bE[:, 1]]
+        d2 = pb[:, :2] - pa[:, :2]
+        L2 = np.einsum("ij,ij->i", d2, d2)
+        live = np.nonzero(L2 >= 1e-8)[0]
+        hits = tree.query_ball_point((pa[live, :2] + pb[live, :2]) / 2, np.sqrt(L2[live]) / 2 + tol)
+        cnt_e = np.fromiter(map(len, hits), int, len(hits))
+        ei = np.repeat(live, cnt_e)                                   # edge of each candidate, edge order
+        v = bv[np.fromiter(itertools.chain.from_iterable(hits), int, int(cnt_e.sum()))]
+        a, b = bE[ei, 0], bE[ei, 1]
+        w = V[v, :2] - pa[ei, :2]
+        t = np.einsum("ij,ij->i", w, d2[ei]) / L2[ei]
+        r = w - t[:, None] * d2[ei]
+        ok = (v != a) & (v != b) & (t > 1e-3) & (t < 1 - 1e-3) & (np.sqrt(np.einsum("ij,ij->i", r, r)) <= tol)
+        ok &= np.abs(V[v, 2] - (pa[ei, 2] + t * (pb[ei, 2] - pa[ei, 2]))) <= maxdz
         ins = defaultdict(list)
-        for (a, b), f, k in zip(bE, bf, bs):
-            pa, pb = V[a], V[b]
-            d2 = pb[:2] - pa[:2]; L2 = float(d2 @ d2)
-            if L2 < 1e-8:
-                continue
-            for c in tree.query_ball_point((pa[:2] + pb[:2]) / 2, math.sqrt(L2) / 2 + tol):
-                v = bv[c]
-                if v == a or v == b:
-                    continue
-                w = V[v, :2] - pa[:2]
-                t = float(w @ d2) / L2
-                if not 1e-3 < t < 1 - 1e-3:
-                    continue
-                if np.linalg.norm(w - t * d2) > tol:
-                    continue
-                if abs(V[v, 2] - (pa[2] + t * (pb[2] - pa[2]))) > maxdz:
-                    continue
-                ins[f].append((k, t, v))
+        for f, k, tt, vv in zip(bf[ei[ok]].tolist(), bs[ei[ok]].tolist(), t[ok].tolist(), v[ok].tolist()):
+            ins[f].append((k, tt, vv))
         if not ins:
             break
         drop, newF, newT = [], [], []
@@ -1505,8 +1518,9 @@ def build_structures(od, dem, top_z, paved_all, lane_idx=None):
         V, F = res[0], res[1]
         c = V[F].mean(1)
         ground = np.abs(c[:, 2] - dem(c[:, 0], c[:, 1])) < 2.0
-        gp.append(robust_union(shapely.polygons(V[F[ground]][:, :, :2])))
-    ground_paved = polys_only(unary_union(gp)) if gp else Polygon()
+        gp.append(shapely.polygons(V[F[ground]][:, :, :2]))
+    # road and sidewalk triangles in one tiled union (two unions, then their union, took ~40 s)
+    ground_paved = robust_union(np.concatenate(gp)) if gp else Polygon()   # polygonal, on the 1 cm grid
     shapely.prepare(ground_paved)
     st = defaultdict(int)
     struct_polys = []
