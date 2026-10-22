@@ -57,9 +57,13 @@ for (x, y, z, _, _), (clat, clon) in zip(probe, carla_ll):
 # lane that runs off the clipped map within 150 m (CARLA's Traffic Manager removes a car at the lane's end)
 cand = wps[wps[:, 3] == 0]
 sel = []
+cells = {}     # selected points by 30 m cell: a point within 30 m lies in the 3 x 3 cells around (was all of sel)
 for p in cand:
-    if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 > 30 ** 2 for q in sel):
+    cx, cy = int(p[0] // 30), int(p[1] // 30)
+    near = [q for i in (cx - 1, cx, cx + 1) for j in (cy - 1, cy, cy + 1) for q in cells.get((i, j), ())]
+    if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 > 30 ** 2 for q in near):
         sel.append(p)
+        cells.setdefault((cx, cy), []).append(p)
 cf = C.BUILD / "spawn_candidates.json"
 json.dump([[float(p[0]), float(p[1]), float(p[2])] for p in sel], open(cf, "w"))
 out = subprocess.run([str(C.ROOT / "venv38/Scripts/python.exe"), str(C.ROOT / "scripts/spawn_exits.py"), str(C.XODR_FILE), str(cf)],

@@ -19,7 +19,7 @@ import shapely
 from lxml import etree
 from PIL import Image
 from rasterio.features import rasterize
-from rasterio.transform import from_bounds
+from rasterio.transform import Affine, from_bounds
 from scipy.ndimage import gaussian_filter, uniform_filter
 from shapely.geometry import LineString, Polygon
 from shapely.ops import linemerge, polygonize
@@ -120,10 +120,18 @@ def main():
     polys = sorted(area_polygons(), key=lambda pc: -pc[0].area)
     tagged = np.zeros((PX, PX), bool)
     for p, c in polys:
-        m = rasterize([(p, 1)], out_shape=(PX, PX), transform=tr).astype(bool)
+        # only the pixel window around the polygon (one pixel margin), with the window's own transform: the same
+        # pixel centres as the whole raster (381 whole-raster passes took ~25 s)
+        bx0, by0, bx1, by1 = p.bounds
+        c0, c1 = max(0, int((bx0 - tr.c) / tr.a) - 1), min(PX, int((bx1 - tr.c) / tr.a) + 2)
+        r0, r1 = max(0, int((by1 - tr.f) / tr.e) - 1), min(PX, int((by0 - tr.f) / tr.e) + 2)
+        if c0 >= c1 or r0 >= r1:
+            continue
+        win = (slice(r0, r1), slice(c0, c1))
+        m = rasterize([(p, 1)], out_shape=(r1 - r0, c1 - c0), transform=tr * Affine.translation(c0, r0)).astype(bool)
         if c == PAVERS:              # planters with real vegetation stay green inside plazas
-            m &= ~((ndvi > NDVI_LAWN + 0.05) & (bmask == 0))
-        cls[m] = c; tagged |= m
+            m &= ~((ndvi[win] > NDVI_LAWN + 0.05) & (bmask[win] == 0))
+        cls[win][m] = c; tagged[win] |= m
     # soft edges: blend the one-hot classes over ~1 m, with a little noise so borders are not straight
     rng = np.random.default_rng(3)
     jitter = gaussian_filter(rng.standard_normal((PX, PX)).astype(np.float32), 3.0)

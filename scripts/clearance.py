@@ -52,32 +52,47 @@ def layer_triangles(arrays):
     return {k: np.concatenate(v) for k, v in tris.items()}
 
 
+def _cross(a, b):
+    """a x b over the last axis (3), broadcasting - np.cross's formulas without its per-call overhead"""
+    a0, a1, a2 = a[..., 0], a[..., 1], a[..., 2]
+    b0, b1, b2 = b[..., 0], b[..., 1], b[..., 2]
+    return np.stack([a1 * b2 - a2 * b1, a2 * b0 - a0 * b2, a0 * b1 - a1 * b0], -1)
+
+
 def seg_hits(P0, P1, T):
     """Moller-Trumbore, all segments (n, 3) x all triangles (m, 3, 3) -> (n,) any hit."""
     if len(T) == 0 or len(P0) == 0:
         return np.zeros(len(P0), bool)
     D = P1 - P0
     e1 = T[:, 1] - T[:, 0]; e2 = T[:, 2] - T[:, 0]
-    h = np.cross(D[:, None, :], e2[None, :, :])
+    h = _cross(D[:, None, :], e2[None, :, :])
     a = np.einsum("mk,nmk->nm", e1, h)
     ok = np.abs(a) > 1e-9
     f = np.where(ok, 1.0 / np.where(ok, a, 1.0), 0.0)
     s = P0[:, None, :] - T[None, :, 0]
     u = f * np.einsum("nmk,nmk->nm", s, h)
-    q = np.cross(s, e1[None, :, :])
+    q = _cross(s, e1[None, :, :])
     v = f * np.einsum("nk,nmk->nm", D, q)
     t = f * np.einsum("mk,nmk->nm", e2, q)
     return (ok & (u >= 0) & (v >= 0) & (u + v <= 1) & (t >= 0) & (t <= 1)).any(1)
 
 
 def _grid(T):
-    lo = np.floor(T[:, :, :2].min(1) / CELL).astype(int); hi = np.floor(T[:, :, :2].max(1) / CELL).astype(int)
-    cells = collections.defaultdict(list)
-    for i in range(len(T)):
-        for cx in range(lo[i, 0], hi[i, 0] + 1):
-            for cy in range(lo[i, 1], hi[i, 1] + 1):
-                cells[(cx, cy)].append(i)
-    return {k: np.array(v) for k, v in cells.items()}
+    """{(cx, cy): indices of the triangles whose plan box meets that CELL x CELL cell} (ascending)"""
+    if len(T) == 0:
+        return {}
+    lo =np.floor(T[:, :, :2].min(1) / CELL).astype(np.int64); hi = np.floor(T[:, :, :2].max(1) / CELL).astype(np.int64)
+    nx, ny = hi[:, 0] - lo[:, 0] + 1, hi[:, 1] - lo[:, 1] + 1
+    n = nx * ny                                        # cells per triangle
+    tri = np.repeat(np.arange(len(T)), n)
+    j = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)   # 0 .. n-1 within each triangle
+    cx = np.repeat(lo[:, 0], n) + j // np.repeat(ny, n)
+    cy = np.repeat(lo[:, 1], n) + j % np.repeat(ny, n)
+    order = np.lexsort((tri, cy, cx))
+    cx, cy, tri = cx[order], cy[order], tri[order]
+    cut = np.flatnonzero((np.diff(cx) != 0) | (np.diff(cy) != 0)) + 1
+    starts = np.concatenate([[0], cut])
+    return {(int(a), int(b)): t for a, b, t in zip(cx[starts], cy[starts], np.split(tri, cut))}
 
 
 def obstructions(probes, tris):

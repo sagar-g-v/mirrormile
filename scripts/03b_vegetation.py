@@ -8,6 +8,8 @@ Outputs
 """
 import json
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import rasterio
@@ -23,6 +25,7 @@ from scipy.spatial import cKDTree
 import config as C
 import importlib
 GB = importlib.import_module("03_build_geometry")
+import geom_par as GP
 
 RES = 0.5                       # canopy model resolution (m)
 NDVI_VEG = 0.12                 # vegetation threshold (low: urban trees are often in shadow)
@@ -44,9 +47,12 @@ def dem_sampler():
     with rasterio.open(C.DEM_UTM) as src:
         d = src.read(1).astype(np.float64); inv = ~src.transform
     d[d < -1000] = np.nanmedian(np.where(d < -1000, np.nan, d))
-    tf = Transformer.from_crs(C.MAP_PROJ, C.UTM_EPSG, always_xy=True)
+    local = threading.local()          # a Transformer per thread (they are not thread-safe)
 
     def f(x, y):
+        tf = getattr(local, "tf", None)
+        if tf is None:
+            tf = local.tf = Transformer.from_crs(C.MAP_PROJ, C.UTM_EPSG, always_xy=True)
         ux, uy = tf.transform(np.asarray(x, float), np.asarray(y, float))
         c, r = inv * (np.asarray(ux), np.asarray(uy))
         return map_coordinates(d, [np.asarray(r) - 0.5, np.asarray(c) - 0.5], order=1, mode="nearest")
@@ -80,15 +86,14 @@ def on_lane(tree, zs, xy, zb, clear):
 
 def canopy_height_model(extent, dem):
     p = np.load(C.DATA / "lidar" / "points.npz")
-    tf = Transformer.from_crs(3857, C.MAP_PROJ, always_xy=True)
-    x, y = tf.transform(p["x"], p["y"])
+    x, y = GP.transform_xy(3857, C.MAP_PROJ, p["x"], p["y"])     # ~100M points, on the threads
     z, cls = p["z"].astype(np.float64), p["cls"]
     keep = (cls != 7) & (cls != 18)                       # noise
     x, y, z, cls = x[keep], y[keep], z[keep], cls[keep]
     ground = cls == 2
     gi = rng.choice(np.flatnonzero(ground), size=min(200000, ground.sum()), replace=False)
     offset = float(np.median(z[gi] - dem(x[gi], y[gi])))   # lidar vertical datum vs DEM (NAVD88)
-    hag = z - offset - dem(x, y)
+    hag = z - offset - GP.pointwise(dem, x, y)                 # DEM at every point, on the threads
     print(f"lidar: {len(x):,} pts, vertical offset to DEM {offset:+.2f} m, "
           f"ground residual p95 {np.percentile(np.abs(hag[gi]), 95):.2f} m")
     tr, W, H = grid(extent)
@@ -120,17 +125,15 @@ def surface_meshes(dem=None):
             if k.startswith(pref) and k.endswith("|V"):
                 Vs.append(g[k]); Fs.append(g[k[:-2] + "|F"] + n); n += len(g[k])
         out[pref] = GB.MeshZ(np.concatenate(Vs), np.concatenate(Fs)) if Vs else None
-    paved = []
-    for pref in ("SideWalk__Concrete", "Road__Asphalt"):
-        for k in g.files:
-            if k.startswith(pref) and k.endswith("|V"):
-                V, F = g[k], g[k[:-2] + "|F"]
-                paved.append(GB.robust_union(shapely.polygons(V[F][:, :, :2])))
-    road = []
-    for k in g.files:
-        if k.startswith("Road__") and k.endswith("|V"):
-            V, F = g[k], g[k[:-2] + "|F"]
-            road.append(GB.robust_union(shapely.polygons(V[F][:, :, :2])))
+    # one union per mesh tile (road tiles serve both lists), the tiles on threads (GEOS releases the GIL); own
+    # executor: robust_union may use the shared geometry pool itself
+    pk = [k for pref in ("SideWalk__Concrete", "Road__Asphalt") for k in g.files if k.startswith(pref) and k.endswith("|V")]
+    rk = [k for k in g.files if k.startswith("Road__") and k.endswith("|V")]
+    keys = list(dict.fromkeys(pk + rk))
+    with ThreadPoolExecutor(max_workers=GP.WORKERS) as ex:
+        tile_u = dict(zip(keys, ex.map(lambda k: GB.robust_union(shapely.polygons(g[k][g[k[:-2] + "|F"]][:, :, :2])), keys)))
+    paved = [tile_u[k] for k in pk]
+    road = [tile_u[k] for k in rk]
 
     def zsurf(P):
         z = np.full(len(P), np.nan)
@@ -142,7 +145,8 @@ def surface_meshes(dem=None):
                 else:
                     z[m] = out[pref](P[m], how="max")
         return z
-    return zsurf, shapely.union_all(paved), shapely.union_all(road)
+    f_paved, f_road = GP.submit(shapely.union_all, paved), GP.submit(shapely.union_all, road)
+    return zsurf, f_paved.result(), f_road.result()
 
 
 def building_polygons():
@@ -155,6 +159,22 @@ def building_polygons():
     return shapely.union_all(polys)
 
 
+class _NearPoints:
+    """Accepted points in a grid of cells: is any closer than d to p? Only the cells within d are looked at -
+    the same answer as the distance to every accepted point (which made the spacing loops quadratic)."""
+
+    def __init__(self, cell):
+        self.cell, self.cells = cell, {}
+
+    def add(self, p):
+        self.cells.setdefault((int(p[0] // self.cell), int(p[1] // self.cell)), []).append((p[0], p[1]))
+
+    def any_within(self, p, d):
+        cx, cy, k = int(p[0] // self.cell), int(p[1] // self.cell), int(d // self.cell) + 1
+        pts = [q for i in range(cx - k, cx + k + 1) for j in range(cy - k, cy + k + 1) for q in self.cells.get((i, j), ())]
+        return bool(pts) and np.min(np.hypot(*(np.array(pts) - p).T)) < d
+
+
 def detect_trees(chm, canopy, tr):
     """Crown peaks on the smoothed canopy, height-adaptive spacing, crown radius from Voronoi area."""
     c = np.where(canopy, chm, 0.0)
@@ -165,13 +185,13 @@ def detect_trees(chm, canopy, tr):
     order = np.argsort(-h)
     r, cidx, h = r[order], cidx[order], h[order]
     xy = np.column_stack([tr.c + (cidx + 0.5) * RES, tr.f - (r + 0.5) * RES])
-    keep, kept = [], cKDTree(np.zeros((0, 2))) if False else None
     acc = []
+    near = _NearPoints(5.0)
     for i, (p, hi) in enumerate(zip(xy, h)):          # non-max suppression: spacing grows with height
         dmin = max(2.5, 0.22 * hi)
-        if acc and np.min(np.hypot(*(np.array(acc)[:, :2] - p).T)) < dmin:
+        if near.any_within(p, dmin):
             continue
-        acc.append((p[0], p[1], hi))
+        acc.append((p[0], p[1], hi)); near.add(p)
     T = np.array(acc)
     # crown radius: canopy pixels assigned to the nearest peak (within 9 m)
     rr, cc = np.nonzero(canopy)
@@ -191,9 +211,13 @@ def main():
     ndvi = ndvi_grid(tr, W, H)
     print("rasters", W, "x", H, f"@ {RES} m")
 
+    # the building union and the three whole-map buffers run on the geometry threads beside the rest
+    f_bld = GP.submit(lambda: (lambda b: (b, b.buffer(0.3)))(building_polygons()))
     zsurf, paved, road = surface_meshes(dem)
-    bld = building_polygons()
-    bmask = rasterize([(bld.buffer(0.3), 1)], out_shape=(H, W), transform=tr).astype(bool)
+    shapely.prepare(road)
+    f_road_in, f_paved_out = GP.submit(road.buffer, -0.5), GP.submit(paved.buffer, 0.05)
+    bld, bld_out = f_bld.result()
+    bmask = rasterize([(bld_out, 1)], out_shape=(H, W), transform=tr).astype(bool)
     pmask = rasterize([(paved, 1)], out_shape=(H, W), transform=tr).astype(bool)
 
     veg = gaussian_filter(ndvi, 0.7) > NDVI_VEG
@@ -204,10 +228,9 @@ def main():
     grass = binary_opening(grass, iterations=2)
 
     T, radius = detect_trees(chm, canopy, tr)
-    shapely.prepare(road)
     lanes, lane_z = lane_areas()
     trees = []
-    on_road = shapely.contains_xy(road.buffer(-0.5), T[:, 0], T[:, 1])
+    on_road = shapely.contains_xy(f_road_in.result(), T[:, 0], T[:, 1])
     base = zsurf(T[:, :2])
     n_lane = 0
     for (x, y, h), r, rd, zb in zip(T, radius, on_road, base):
@@ -242,11 +265,12 @@ def main():
     sp_xy = np.column_stack([tr.c + (cc + 0.5) * RES, tr.f - (rr + 0.5) * RES])
     sp_h = chm[rr, cc]
     shrubs, taken = [], []
+    near = _NearPoints(2.0)
     for i in rng.permutation(len(sp_xy)):
         p = sp_xy[i]
-        if taken and np.min(np.hypot(*(np.array(taken) - p).T)) < 1.6:
+        if near.any_within(p, 1.6):
             continue
-        taken.append(p)
+        taken.append(p); near.add(p)
         if len(taken) > 4000:
             break
     if taken:
@@ -263,15 +287,18 @@ def main():
     # grass patches -> mesh 3 cm above the surface underneath
     gpolys = [shapely.geometry.shape(gm) for gm, v in shapes(grass.astype(np.uint8), mask=grass, transform=tr) if v == 1]
     gu = shapely.union_all(gpolys).simplify(0.25)
-    gu = GB.polys_only(gu.difference(paved.buffer(0.05)).difference(bld))
+    gu = GB.polys_only(gu.difference(f_paved_out.result()).difference(bld))
     layer = GB.Layer()
     n_patch = 0
-    for p in shapely.get_parts(gu):
-        if p.area < 3.0:
-            continue
-        res = GB.triangulate(p, lambda P: zsurf(P) + 0.03, GB.planar_uv, seg=2.0)
-        if res:
-            V, F, UV = res
+    # triangulate every patch first, then the surface height of all their points in one call (per patch it was
+    # ~9000 DEM / mesh queries with their set-up cost each); zsurf works point by point, so the same heights
+    tris = [res for p in shapely.get_parts(gu) if p.area >= 3.0
+            for res in [GB.triangulate(p, lambda P: np.zeros(len(P)), GB.planar_uv, seg=2.0)] if res]
+    if tris:
+        Z = zsurf(np.concatenate([V[:, :2] for V, _, _ in tris])) + 0.03
+        cut = np.cumsum([len(V) for V, _, _ in tris])[:-1]
+        for (V, F, UV), z in zip(tris, np.split(Z, cut)):
+            V[:, 2] = z
             ok = ~np.isnan(V[F]).any((1, 2))
             layer.add(V, F[ok], UV); n_patch += 1
     arrays = {}

@@ -16,6 +16,22 @@ def _poly(rec, ds):
     return rec[0] + rec[1] * ds + rec[2] * ds * ds + rec[3] * ds * ds * ds
 
 
+_PIECES = {}
+
+
+def _piece_arrays(records):
+    """(starts, coefficients (n, 4)) of a record list, cached by list identity; starts None if not ascending."""
+    hit = _PIECES.get(id(records))
+    if hit is not None and hit[0] is records and hit[3] == len(records):
+        return hit[1], hit[2]
+    S0 = np.array([r[0] for r in records], float)
+    A = np.array([r[1] for r in records], float).reshape(-1, 4)
+    if np.any(np.diff(S0) < 0):
+        S0 = None
+    _PIECES[id(records)] = (records, S0, A, len(records))
+    return S0, A
+
+
 def _abcd(e):
     return tuple(float(e.get(k, 0)) for k in ("a", "b", "c", "d"))
 
@@ -185,15 +201,23 @@ class Road:
 
     @staticmethod
     def _piecewise(records, s):
+        """records [(s0, (a, b, c, d))] by s0: the last record starting at or before s (1e-9 slack), the first
+        one before every start. One search for all s (a mask per record was slow for many short records)."""
         s = np.asarray(s, float)
         if not records:
             return np.zeros_like(s)
-        out = np.zeros_like(s)
-        for i, (s0, rec) in enumerate(records):
-            s1 = records[i + 1][0] if i + 1 < len(records) else 1e18
-            m = (s >= s0 - 1e-9) & (s < s1) if i else (s < s1)
-            out[m] = _poly(rec, s[m] - s0)
-        return out
+        S0, A = _piece_arrays(records)
+        if S0 is None:                       # starts not ascending: the record-by-record rule
+            out = np.zeros_like(s)
+            for i, (s0, rec) in enumerate(records):
+                s1 = records[i + 1][0] if i + 1 < len(records) else 1e18
+                m = (s >= s0 - 1e-9) & (s < s1) if i else (s < s1)
+                out[m] = _poly(rec, s[m] - s0)
+            return out
+        i = np.maximum(np.searchsorted(S0 - 1e-9, s, side="right") - 1, 0)
+        ds = s - S0[i]
+        a = A[i]
+        return a[..., 0] + a[..., 1] * ds + a[..., 2] * ds * ds + a[..., 3] * ds * ds * ds
 
     def z(self, s):
         """Elevation of the reference line."""
@@ -211,15 +235,7 @@ class Road:
         return z + np.asarray(t, float) * np.tan(self.superelevation(s))
 
     def lane_offset(self, s):
-        s = np.asarray(s, float)
-        if not self.offsets:
-            return np.zeros_like(s)
-        out = np.zeros_like(s)
-        for i, (s0, rec) in enumerate(self.offsets):
-            s1 = self.offsets[i + 1][0] if i + 1 < len(self.offsets) else 1e18
-            m = (s >= s0 - 1e-9) & (s < s1) if i else (s < s1)
-            out[m] = _poly(rec, s[m] - s0)
-        return out
+        return self._piecewise(self.offsets, s)
 
     def xyz(self, s, t, dz=0.0):
         x, y, h = self.ref(s)

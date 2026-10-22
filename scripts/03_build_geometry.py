@@ -4,6 +4,7 @@ Layers are named "<CarlaLabel>__<Material>"; CarlaLabel is the CARLA semantic fo
 (Road, SideWalk, RoadLine, Terrain, Building) that the asset will be imported into.
 """
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -23,26 +24,44 @@ from shapely.geometry import Polygon, MultiPolygon, LineString
 from shapely.ops import polygonize, linemerge
 
 
+# results of the 1 mm grid union (polys_only / unary_union) by id: such a geometry is already polygonal, valid and
+# on the grid, so polys_only of it is itself - skipping the repeat saves re-uniting whole-map geometries
+_SNAPPED = {}
+
+
+def _snapped(g):
+    if shapely.get_num_coordinates(g) >= 500:    # small ones are cheap to redo; keep the cache small
+        _SNAPPED[id(g)] = g
+    return g
+
+
 def polys_only(g):
+    if _SNAPPED.get(id(g)) is g:
+        return g
     g = shapely.make_valid(g)
     parts = [p for p in shapely.get_parts(g) if p.geom_type in ("Polygon", "MultiPolygon") and not p.is_empty]
-    return shapely.union_all(parts, grid_size=1e-3) if parts else Polygon()
+    return _snapped(shapely.union_all(parts, grid_size=1e-3)) if parts else Polygon()
+
+
+UNION_TILES = 16      # large unions: 16 x 16 tiles by centroid, then the tiles (whole-map unions of ~650k
+UNION_TILED_FROM = 20000   # triangles took 60-160 s and fell back to the 5 mm buffer pass; tiled: ~30 s)
 
 
 def robust_union(polys, grid=1e-2):
     """Union of many (possibly degenerate) triangles: grid-snapped union, falling back to repaired
-    geometry and finally a tiny buffer when GEOS reports a topology exception."""
+    geometry and finally a tiny buffer when GEOS reports a topology exception. Large inputs are united
+    tile by tile (same fallbacks per tile), then the tiles."""
     polys = np.asarray(polys, dtype=object)
     polys = polys[~shapely.is_empty(polys)] if len(polys) else polys
-    try:
-        return shapely.union_all(polys, grid_size=grid)
-    except shapely.errors.GEOSException:
-        pass
-    good = shapely.make_valid(polys)
-    try:
-        return shapely.union_all(good, grid_size=grid)
-    except shapely.errors.GEOSException:
-        return shapely.union_all(shapely.buffer(good, 0.005)).buffer(-0.005)
+    if len(polys) >= UNION_TILED_FROM:
+        c = shapely.centroid(polys)
+        x, y = shapely.get_x(c), shapely.get_y(c)
+        ix = np.minimum((UNION_TILES * (x - x.min()) / max(np.ptp(x), 1e-9)).astype(int), UNION_TILES - 1)
+        iy = np.minimum((UNION_TILES * (y - y.min()) / max(np.ptp(y), 1e-9)).astype(int), UNION_TILES - 1)
+        key = ix * UNION_TILES + iy
+        parts = geom_par.union_groups([polys[key == k] for k in np.unique(key)], grid)   # tiles in parallel
+        return geom_par.union_with_fallbacks(np.asarray(parts, dtype=object), grid)
+    return geom_par.union_with_fallbacks(polys, grid)
 
 
 def unary_union(geoms):
@@ -50,9 +69,10 @@ def unary_union(geoms):
     if not isinstance(geoms, (list, tuple)):
         geoms = [geoms]
     parts = [polys_only(g) for g in geoms if g is not None and not g.is_empty]
-    return shapely.union_all(parts, grid_size=1e-3) if parts else Polygon()
+    return _snapped(shapely.union_all(parts, grid_size=1e-3)) if parts else Polygon()
 
 import config as C
+import geom_par
 from opendrive import OpenDrive, write_elevation
 
 CURB = 0.15          # sidewalk height above road (m)
@@ -114,15 +134,33 @@ class Layer:
         F = np.concatenate([np.stack([i, i + 1, i + n + 1], 1), np.stack([i, i + n + 1, i + n], 1)])
         self.add(V, F, UV)
 
+    def _chunks(self):
+        """(plan bounding box (k,4), first global vertex index (k,)) of each chunk, kept up to date as chunks
+        are added; rebuilt when the chunk list itself is replaced (vertices of a chunk never change)."""
+        if getattr(self, "_bb_of", None) is not self.V:
+            self._bb_of, self._bb, self._base = self.V, np.zeros((0, 4)), np.zeros(0, np.int64)
+        k = len(self._bb)
+        if k < len(self.V):
+            new = self.V[k:]
+            bb = np.array([(V[:, 0].min(), V[:, 1].min(), V[:, 0].max(), V[:, 1].max()) for V in new])
+            start = (self._base[-1] + len(self.V[k - 1])) if k else 0
+            base = start + np.concatenate([[0], np.cumsum([len(V) for V in new])[:-1]])
+            self._bb, self._base = np.concatenate([self._bb, bb]), np.concatenate([self._base, base])
+        return self._bb, self._base
+
     def drop_faces_inside(self, region, zref=None, tol=None):
         """Remove faces whose centroid lies inside `region` (and, if zref given, within tol of it)."""
         if not self.F or region.is_empty:
             return 0
         shapely.prepare(region)
-        dropped, base = 0, 0
-        for k in range(len(self.F)):
+        dropped = 0
+        # only chunks whose box meets the region's box can hold a face centroid inside it
+        bb, bases = self._chunks()
+        x0, y0, x1, y1 = region.bounds
+        near = np.nonzero((bb[:, 0] <= x1) & (bb[:, 2] >= x0) & (bb[:, 1] <= y1) & (bb[:, 3] >= y0))[0]
+        for k in near.tolist():
+            base = int(bases[k])
             c = self.V[k][self.F[k] - base].mean(1)        # F holds global indices
-            base += len(self.V[k])
             inside = shapely.contains_xy(region, c[:, 0], c[:, 1])
             if zref is not None:
                 inside &= np.abs(c[:, 2] - zref) < tol
@@ -399,12 +437,21 @@ def refined_triangulate(poly, zfun, step=2.5, seg=1.5):
     D = Delaunay(pts)
     F = D.simplices
     tp = shapely.polygons(pts[F])
-    shapely.prepare(poly)
-    keep = shapely.within(tp, poly.buffer(0.01))
+    near = poly.buffer(0.01)
+    shapely.prepare(near)
+    keep = shapely.within(tp, near)
     F = F[keep]
     V = np.column_stack([pts, zfun(pts)])
     parts_V, parts_F, n = [V], [F], len(V)
-    left = poly.difference(shapely.union_all(tp[keep], grid_size=1e-4), grid_size=1e-4)
+    # Delaunay triangles do not overlap: their coverage union is far cheaper than a general union (the
+    # difference snaps it to the same 0.1 mm grid); the general union when the coverage union is not valid
+    try:
+        covered = shapely.coverage_union_all(tp[keep])
+        if not covered.is_valid:
+            raise shapely.errors.GEOSException("invalid coverage union")
+    except shapely.errors.GEOSException:      # sliver triangles: not a clean coverage
+        covered = shapely.union_all(tp[keep], grid_size=1e-4)
+    left = poly.difference(covered, grid_size=1e-4)
     for piece in shapely.get_parts(left):
         if piece.geom_type != "Polygon" or piece.area < 1e-4:
             continue
@@ -510,7 +557,9 @@ def build_junctions(od, net_file, drive_polys, walk_polys, junction_drive, drive
             zJ = float(np.mean([v[2] for t in tri for v in t])) if tri else float("nan")
             jlist.append((jid, J, zJ))
     patches, corners_all, d_walk = [], [], 0
-    jdrive_u = unary_union([p for v in junction_drive.values() for p in v])
+    # the whole-map unions of drive and walk strips (only read below) on threads while the junctions are built
+    f_all_drive = geom_par.submit(lambda: unary_union(drive_polys + [unary_union([p for v in junction_drive.values() for p in v])]))
+    f_walk_u = geom_par.submit(unary_union, walk_polys)
     for jid, J, zJ in jlist:
         cxy = np.array(J.representative_point().coords[0])
         Jq = J.buffer(3.0)
@@ -596,9 +645,8 @@ def build_junctions(od, net_file, drive_polys, walk_polys, junction_drive, drive
                 zt = zpad(P)
                 LAYERS["SideWalk__Curb"].wall(P, zt - CURB - 0.03, zt)
     print(f"cleanup: dropped {d_walk} sidewalk faces inside junction asphalt (same level)")
-    road_patch = unary_union(patches)
-    all_drive = unary_union(drive_polys + [jdrive_u])
-    return all_drive, unary_union(walk_polys), road_patch, unary_union(corners_all), zroad, zwalk
+    f_patch, f_corners = geom_par.submit(unary_union, patches), geom_par.submit(unary_union, corners_all)
+    return f_all_drive.result(), f_walk_u.result(), f_patch.result(), f_corners.result(), zroad, zwalk
 
 
 # ----------------------------------------------------------------------------------- markings
@@ -667,6 +715,7 @@ def opposing_centre(od, max_gap=1.5):
 
 def build_markings(od):
     centre = opposing_centre(od)
+    cross_tree = shapely.STRtree(CROSS_BANDS)     # stop bars keep clear of crosswalks (was a scan of all)
     tf_ = C.BUILD / "road_types.json"
     types = json.loads(tf_.read_text()) if tf_.exists() else {}
     for r in od.roads:
@@ -743,7 +792,7 @@ def build_markings(od):
                         t0 = B[lanes[0].id][0]; t1 = B[lanes[-1].id][1]
                         A = np.stack([r.xyz(np.full(8, s[k]), np.linspace(t0[k], t1[k], 8), MARK_Z) for k in range(2)])
                         bar = Polygon(np.concatenate([A[0, :, :2], A[1, ::-1, :2]])).buffer(0.3)
-                        if not any(bar.intersects(q) for q in CROSS_BANDS):
+                        if not len(cross_tree.query(bar, predicate="intersects")):
                             break
                         lo, hi = lo + step, hi + step
                         if not (sec.s < lo < sec.e and sec.s < hi < sec.e):
@@ -849,7 +898,7 @@ LANE_HEADROOM = 4.5    # m kept free above a vehicle lane (tunnel / underpass ce
 LANE_TERRAIN = {}      # terrain vertices pushed under / cut over vehicle lanes (stats)
 
 
-def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, lanes=None):
+def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, lanes=None, paved_in=None):
     """Terrain conformed under ground-level pavement only: bridges keep the ground under them,
     tunnels keep the ground above them (and the ground is carved where it would cut into a
     tunnel, near its portals). With lanes (lane_pieces): no terrain inside the space a car occupies
@@ -867,30 +916,33 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, la
     znear = gp[i[:, 0], 2]
     zmin = gp[i, 2].min(1)
     inside = shapely.contains_xy(paved, P[:, 0], P[:, 1])
+    pz_in = None                     # PAVED_Z at the final `inside` points (computed once)
     if inside.any():
         pz = PAVED_Z(P[inside])
         lvl_ok = ~np.isnan(pz) & (np.abs(pz - Z[inside]) < 2.0)
         tmp = np.zeros(len(P), bool); tmp[np.flatnonzero(inside)[lvl_ok]] = True
         inside = tmp
+        pz_in = pz[lvl_ok]
     w = np.clip((d[:, 0] - 0.5) / 8.0, 0, 1) ** 1.5
     Zc = np.where(inside, zmin - 0.35, (znear - 0.03) * (1 - w) + Z * w)
     # far from ground-level roads keep the DEM untouched
     Zc = np.where((d[:, 0] > 9.0) & ~inside, Z, Zc)
     # inside paved areas never let the terrain come closer than 30 cm below the surface
     if inside.any():
-        pz = PAVED_Z(P[inside])
+        pz = pz_in
         Zc[inside] = np.where(np.isnan(pz), Zc[inside], np.minimum(Zc[inside], pz - 0.30))
     cut_v = np.zeros(len(P), bool)
     if lanes is not None:
         ltree, _, lz = lanes
-        vi, pk = ltree.query(shapely.points(P), predicate="dwithin", distance=0.5)
+        Ppts = shapely.points(P)                  # grid points as geometries, for both lane queries
+        vi, pk = ltree.query(Ppts, predicate="dwithin", distance=0.5)
         dz = Zc[vi] - lz[pk]
         push = (dz > -LANE_UNDER) & (dz < LANE_PUSH)
         np.minimum.at(Zc, vi[push], lz[pk[push]] - LANE_UNDER)
         cut_v[vi[(dz >= LANE_PUSH) & (dz < LANE_HEADROOM)]] = True
         # the next grid row (up to one TERRAIN_STEP out) spans the triangles that slope over the lane edge: push
         # it under as well (no cut there - that would open holes beside the road)
-        vo, po = ltree.query(shapely.points(P), predicate="dwithin", distance=TERRAIN_STEP)
+        vo, po = ltree.query(Ppts, predicate="dwithin", distance=TERRAIN_STEP)
         dzo = Zc[vo] - lz[po]
         own = np.zeros(len(P), bool)              # ground next to a lane of its own level (a street above a trench)
         own[vo[np.abs(dzo) < 0.5]] = True
@@ -903,7 +955,7 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, la
     F = np.concatenate([np.stack([a, b, c], 1), np.stack([a, c, dd], 1)])
     # drop faces deep inside ground-level paved areas (never visible, saves ~40% triangles)
     cen = P[F].mean(1)
-    deep = shapely.contains_xy(paved.buffer(-1.5), cen[:, 0], cen[:, 1]) & inside[F].all(1)
+    deep = shapely.contains_xy(paved.buffer(-1.5) if paved_in is None else paved_in, cen[:, 0], cen[:, 1]) & inside[F].all(1)
     # carve the ground where it would cut into a tunnel (near portals)
     if tunnel_fp is not None and not tunnel_fp.is_empty:
         intun = shapely.contains_xy(tunnel_fp.buffer(0.5), cen[:, 0], cen[:, 1])
@@ -920,7 +972,7 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, la
         # between them slope through the underpass - drop them (the deck covers the gap)
         ltree, _, lz = lanes
         Vz = Zc[F]
-        fi, pk = ltree.query(shapely.points(P[F].mean(1)), predicate="dwithin", distance=0.5)
+        fi, pk = ltree.query(shapely.points(cen), predicate="dwithin", distance=0.5)
         over = (Vz[fi].max(1) > lz[pk] + 0.15) & (Vz[fi].min(1) < lz[pk] + LANE_HEADROOM)
         drop = np.zeros(len(F), bool); drop[fi[over]] = True
         LANE_TERRAIN["faces_dropped"] = int((drop & ~deep).sum())
@@ -1076,13 +1128,16 @@ def lane_passage(g, base, top, lanes):
     return g.difference(unary_union(list(lpolys[k])).buffer(0.3)), len(k)
 
 
-def build_buildings(dem, extent, paved, lanes=None):
+def build_buildings(dem, extent, paved, lanes=None, paved_off=None):
     box = shapely.box(*extent)
     polys = osm_polygons()
     parts = [(p, t) for p, t in polys if "building:part" in t and t.get("building:part") != "no"]
     part_tree = shapely.STRtree([p for p, _ in parts]) if parts else None
     stats = defaultdict(int)
     tiers_all = load_building_tiers()
+    # the paved area grown by 5 cm, once (buffering the whole map's paving per building took ~40 min)
+    paved_off = paved.buffer(0.05) if paved_off is None else paved_off
+    shapely.prepare(paved)
     for raw, tags in polys:
         if is_underground(tags):
             stats["underground_skipped"] += 1
@@ -1109,7 +1164,7 @@ def build_buildings(dem, extent, paved, lanes=None):
         if tags.get("building") in ("roof", "carport", "canopy") and not minh:
             minh = max(0.0, h - 1.0)
         # keep buildings off the street (OSM footprints sometimes overlap the curb)
-        poly = poly.difference(paved.buffer(0.05)) if poly.intersects(paved) else poly
+        poly = poly.difference(paved_off) if poly.intersects(paved) else poly
         pieces = []
         for g in shapely.get_parts(poly):
             if g.geom_type != "Polygon" or g.area < 4:
@@ -1197,30 +1252,32 @@ def fix_t_junctions(V, F, T, tol=5e-3, maxdz=0.03, iters=8):
         E = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
         fid = np.tile(np.arange(len(F)), 3); slot = np.repeat([0, 1, 2], len(F))
         key = np.sort(E, 1)
-        _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+        # rows (a, b) packed as a * n + b: same grouping and order as unique rows, without sorting row records
+        _, inv, cnt = np.unique(key[:, 0] * np.int64(len(V)) + key[:, 1], return_inverse=True, return_counts=True)
         bnd = cnt[inv.ravel()] == 1
         bE, bf, bs = E[bnd], fid[bnd], slot[bnd]
         bv = np.unique(bE)
         tree = cKDTree(V[bv, :2])
+        # every boundary edge against the boundary vertices near it, all edges at once (a loop over ~100k edges
+        # with one ball query each took ~30 s): v on edge a-b strictly inside, within tol of it, within maxdz of
+        # the edge's height there
+        pa, pb = V[bE[:, 0]], V[bE[:, 1]]
+        d2 = pb[:, :2] - pa[:, :2]
+        L2 = np.einsum("ij,ij->i", d2, d2)
+        live = np.nonzero(L2 >= 1e-8)[0]
+        hits = tree.query_ball_point((pa[live, :2] + pb[live, :2]) / 2, np.sqrt(L2[live]) / 2 + tol)
+        cnt_e = np.fromiter(map(len, hits), int, len(hits))
+        ei = np.repeat(live, cnt_e)                                   # edge of each candidate, edge order
+        v = bv[np.fromiter(itertools.chain.from_iterable(hits), int, int(cnt_e.sum()))]
+        a, b = bE[ei, 0], bE[ei, 1]
+        w = V[v, :2] - pa[ei, :2]
+        t = np.einsum("ij,ij->i", w, d2[ei]) / L2[ei]
+        r = w - t[:, None] * d2[ei]
+        ok = (v != a) & (v != b) & (t > 1e-3) & (t < 1 - 1e-3) & (np.sqrt(np.einsum("ij,ij->i", r, r)) <= tol)
+        ok &= np.abs(V[v, 2] - (pa[ei, 2] + t * (pb[ei, 2] - pa[ei, 2]))) <= maxdz
         ins = defaultdict(list)
-        for (a, b), f, k in zip(bE, bf, bs):
-            pa, pb = V[a], V[b]
-            d2 = pb[:2] - pa[:2]; L2 = float(d2 @ d2)
-            if L2 < 1e-8:
-                continue
-            for c in tree.query_ball_point((pa[:2] + pb[:2]) / 2, math.sqrt(L2) / 2 + tol):
-                v = bv[c]
-                if v == a or v == b:
-                    continue
-                w = V[v, :2] - pa[:2]
-                t = float(w @ d2) / L2
-                if not 1e-3 < t < 1 - 1e-3:
-                    continue
-                if np.linalg.norm(w - t * d2) > tol:
-                    continue
-                if abs(V[v, 2] - (pa[2] + t * (pb[2] - pa[2]))) > maxdz:
-                    continue
-                ins[f].append((k, t, v))
+        for f, k, tt, vv in zip(bf[ei[ok]].tolist(), bs[ei[ok]].tolist(), t[ok].tolist(), v[ok].tolist()):
+            ins[f].append((k, tt, vv))
         if not ins:
             break
         drop, newF, newT = [], [], []
@@ -1485,8 +1542,9 @@ def build_structures(od, dem, top_z, paved_all, lane_idx=None):
         V, F = res[0], res[1]
         c = V[F].mean(1)
         ground = np.abs(c[:, 2] - dem(c[:, 0], c[:, 1])) < 2.0
-        gp.append(robust_union(shapely.polygons(V[F[ground]][:, :, :2])))
-    ground_paved = polys_only(unary_union(gp)) if gp else Polygon()
+        gp.append(shapely.polygons(V[F[ground]][:, :, :2]))
+    # road and sidewalk triangles in one tiled union (two unions, then their union, took ~40 s)
+    ground_paved = robust_union(np.concatenate(gp)) if gp else Polygon()   # polygonal, on the 1 cm grid
     shapely.prepare(ground_paved)
     st = defaultdict(int)
     struct_polys = []
@@ -1746,6 +1804,7 @@ def main():
     PAVED_Z = lambda Q: np.fmin(road_z(Q, "min"), walk_z(Q, "min"))
 
     paved = unary_union([all_drive, walk_u, road_patch, corner_u]).buffer(0.05)
+    f_paved_in = geom_par.submit(paved.buffer, -1.5)     # for the terrain, on a thread meanwhile
     rx0, ry0, rx1, ry1 = paved.bounds
     dem = Dem(C.DEM_UTM, filt=3)
     # terrain extent: road extent + margin, clamped to DEM coverage (in map frame)
@@ -1756,23 +1815,27 @@ def main():
               min(rx1 + TERRAIN_MARGIN, min(cx[1], cx[3]) - 2), min(ry1 + TERRAIN_MARGIN, min(cy[2], cy[3]) - 2))
     extent = tuple(float(round(v / TERRAIN_STEP) * TERRAIN_STEP) for v in extent)
     print("extent", extent)
-    build_ortho(extent)
+    f_ortho = geom_par.submit(build_ortho, extent)      # the ground texture (raster only) beside the meshes
     # bridges / tunnels / freeway barriers
     # surface at the same level as zref (within 1 m) next to a structure edge, NaN if none
     top_z = lambda Q, zr: np.fmax(road_z(Q, "near", zref=zr, tol=1.0), walk_z(Q, "near", zref=zr, tol=1.0))
     lanes = lane_pieces(od)
     sstats, ground_paved = build_structures(od, dem, top_z, paved, lanes)
+    f_ground_off = geom_par.submit(ground_paved.buffer, 0.05)   # for the buildings, on a thread meanwhile
     print("structures:", sstats)
     runs = json.loads((C.BUILD / "road_levels.json").read_text())
     tunnel_fp = structure_footprints(od, runs, ("tunnel",))
     wall = LAYERS["Wall__Struct"].arrays()
     roof_z = MeshZ(wall[0], wall[1]) if wall is not None else (lambda Q, how="max": np.full(len(Q), np.nan))
     paved_pts = np.concatenate([dpts, wpts])
-    nt = build_terrain(dem, extent, paved, paved_pts, tunnel_fp, lambda Q: roof_z(Q, "max"), lanes)
+    nt = build_terrain(dem, extent, paved, paved_pts, tunnel_fp, lambda Q: roof_z(Q, "max"), lanes,
+                       paved_in=f_paved_in.result())
     print("terrain tris", nt, "| at vehicle lanes:", LANE_TERRAIN)
-    bstats = build_buildings(Dem(C.DEM_UTM, filt=5), extent, ground_paved, lanes)
+    bstats = build_buildings(Dem(C.DEM_UTM, filt=5), extent, ground_paved, lanes, paved_off=f_ground_off.result())
     print("buildings", bstats)
+    f_preview = geom_par.submit(preview, extent, C.BUILD / "preview_top.png")   # reads the layers, as export does
     summary = export(extent)
+    f_ortho.result()
     meta = json.loads(C.META_FILE.read_text()) if C.META_FILE.exists() else {}
     meta.update(extent=extent, tile=TILE, ortho="T_LA_Ortho_D.jpg", map_proj=C.MAP_PROJ, lat0=C.LAT0, lon0=C.LON0,
                 layers=summary, tris_total=int(sum(summary.values())))
@@ -1783,7 +1846,7 @@ def main():
     for k, v in sorted(tot.items()):
         print(f"  {k:24s} {v:8d} tris")
     print("total tris", sum(tot.values()))
-    preview(extent, C.BUILD / "preview_top.png")
+    f_preview.result()
 
 
 if __name__ == "__main__":
