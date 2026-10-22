@@ -38,11 +38,11 @@ ORTHO_UTM = DATA / "ortho_utm.tif"
 NET_FILE = BUILD / f"{MAP_NAME}.net.xml"
 XODR_FILE = EXPORT / f"{MAP_NAME}.xodr"
 
-# where the road network comes from: "sumo" (netconvert + the 02b..02f refinements) or "odrforge" (osm2xodr, carla
+# where the road network comes from: "sumo" (netconvert + the 02b..02f refinements) or "odrforge" (odrforge build, carla
 # profile: junction surfaces, stop / speed signs and signal controllers are already in its OpenDRIVE; no SUMO net)
 import os as _os
 XODR_SOURCE = _os.environ.get("MIRRORMILE_XODR", "sumo")
-ODRFORGE_EXE = Path(_os.environ.get("ODRFORGE_EXE", r"C:\mywork\git_repos\odrforge\build\Release\osm2xodr.exe"))
+ODRFORGE_EXE = Path(_os.environ.get("ODRFORGE_EXE", r"C:\mywork\git_repos\odrforge\build\Release\odrforge.exe"))
 ODRFORGE_TERRAIN = BUILD / "odrforge"   # ground.odrz / decks.odrz (OdrForge's make_terrain.py grids for this area)
 GEOM_FILE = BUILD / "geometry.npz"     # meshes produced by 03, consumed by Blender
 META_FILE = BUILD / "meta.json"

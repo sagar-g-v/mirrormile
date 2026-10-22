@@ -1,7 +1,7 @@
 # OSM + USGS lidar DEM + NAIP -> OpenDRIVE (OdrForge) + Blender + FBX for CARLA (UE5)
 # Same as run_all.ps1 -SkipDownload, with the road network from OdrForge (02_odrforge_xodr.py) instead of SUMO
 # netconvert and its refinements (02, 02b, 02d, 02e, 02f). Reuses the data/ downloads.
-# Usage:  .\run_odrforge.ps1   (ODRFORGE_EXE: osm2xodr.exe, default the odrforge Release build)
+# Usage:  .\run_odrforge.ps1   (ODRFORGE_EXE: the odrforge command line, default the odrforge Release build)
 $ErrorActionPreference = "Continue"
 Set-Location $PSScriptRoot
 $env:MIRRORMILE_XODR = "odrforge"
