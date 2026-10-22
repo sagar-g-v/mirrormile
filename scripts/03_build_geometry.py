@@ -134,15 +134,33 @@ class Layer:
         F = np.concatenate([np.stack([i, i + 1, i + n + 1], 1), np.stack([i, i + n + 1, i + n], 1)])
         self.add(V, F, UV)
 
+    def _chunks(self):
+        """(plan bounding box (k,4), first global vertex index (k,)) of each chunk, kept up to date as chunks
+        are added; rebuilt when the chunk list itself is replaced (vertices of a chunk never change)."""
+        if getattr(self, "_bb_of", None) is not self.V:
+            self._bb_of, self._bb, self._base = self.V, np.zeros((0, 4)), np.zeros(0, np.int64)
+        k = len(self._bb)
+        if k < len(self.V):
+            new = self.V[k:]
+            bb = np.array([(V[:, 0].min(), V[:, 1].min(), V[:, 0].max(), V[:, 1].max()) for V in new])
+            start = (self._base[-1] + len(self.V[k - 1])) if k else 0
+            base = start + np.concatenate([[0], np.cumsum([len(V) for V in new])[:-1]])
+            self._bb, self._base = np.concatenate([self._bb, bb]), np.concatenate([self._base, base])
+        return self._bb, self._base
+
     def drop_faces_inside(self, region, zref=None, tol=None):
         """Remove faces whose centroid lies inside `region` (and, if zref given, within tol of it)."""
         if not self.F or region.is_empty:
             return 0
         shapely.prepare(region)
-        dropped, base = 0, 0
-        for k in range(len(self.F)):
+        dropped = 0
+        # only chunks whose box meets the region's box can hold a face centroid inside it
+        bb, bases = self._chunks()
+        x0, y0, x1, y1 = region.bounds
+        near = np.nonzero((bb[:, 0] <= x1) & (bb[:, 2] >= x0) & (bb[:, 1] <= y1) & (bb[:, 3] >= y0))[0]
+        for k in near.tolist():
+            base = int(bases[k])
             c = self.V[k][self.F[k] - base].mean(1)        # F holds global indices
-            base += len(self.V[k])
             inside = shapely.contains_xy(region, c[:, 0], c[:, 1])
             if zref is not None:
                 inside &= np.abs(c[:, 2] - zref) < tol
@@ -696,6 +714,7 @@ def opposing_centre(od, max_gap=1.5):
 
 def build_markings(od):
     centre = opposing_centre(od)
+    cross_tree = shapely.STRtree(CROSS_BANDS)     # stop bars keep clear of crosswalks (was a scan of all)
     tf_ = C.BUILD / "road_types.json"
     types = json.loads(tf_.read_text()) if tf_.exists() else {}
     for r in od.roads:
@@ -772,7 +791,7 @@ def build_markings(od):
                         t0 = B[lanes[0].id][0]; t1 = B[lanes[-1].id][1]
                         A = np.stack([r.xyz(np.full(8, s[k]), np.linspace(t0[k], t1[k], 8), MARK_Z) for k in range(2)])
                         bar = Polygon(np.concatenate([A[0, :, :2], A[1, ::-1, :2]])).buffer(0.3)
-                        if not any(bar.intersects(q) for q in CROSS_BANDS):
+                        if not len(cross_tree.query(bar, predicate="intersects")):
                             break
                         lo, hi = lo + step, hi + step
                         if not (sec.s < lo < sec.e and sec.s < hi < sec.e):
