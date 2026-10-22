@@ -1815,7 +1815,7 @@ def main():
               min(rx1 + TERRAIN_MARGIN, min(cx[1], cx[3]) - 2), min(ry1 + TERRAIN_MARGIN, min(cy[2], cy[3]) - 2))
     extent = tuple(float(round(v / TERRAIN_STEP) * TERRAIN_STEP) for v in extent)
     print("extent", extent)
-    build_ortho(extent)
+    f_ortho = geom_par.submit(build_ortho, extent)      # the ground texture (raster only) beside the meshes
     # bridges / tunnels / freeway barriers
     # surface at the same level as zref (within 1 m) next to a structure edge, NaN if none
     top_z = lambda Q, zr: np.fmax(road_z(Q, "near", zref=zr, tol=1.0), walk_z(Q, "near", zref=zr, tol=1.0))
@@ -1833,7 +1833,9 @@ def main():
     print("terrain tris", nt, "| at vehicle lanes:", LANE_TERRAIN)
     bstats = build_buildings(Dem(C.DEM_UTM, filt=5), extent, ground_paved, lanes, paved_off=f_ground_off.result())
     print("buildings", bstats)
+    f_preview = geom_par.submit(preview, extent, C.BUILD / "preview_top.png")   # reads the layers, as export does
     summary = export(extent)
+    f_ortho.result()
     meta = json.loads(C.META_FILE.read_text()) if C.META_FILE.exists() else {}
     meta.update(extent=extent, tile=TILE, ortho="T_LA_Ortho_D.jpg", map_proj=C.MAP_PROJ, lat0=C.LAT0, lon0=C.LON0,
                 layers=summary, tris_total=int(sum(summary.values())))
@@ -1844,7 +1846,7 @@ def main():
     for k, v in sorted(tot.items()):
         print(f"  {k:24s} {v:8d} tris")
     print("total tris", sum(tot.values()))
-    preview(extent, C.BUILD / "preview_top.png")
+    f_preview.result()
 
 
 if __name__ == "__main__":
