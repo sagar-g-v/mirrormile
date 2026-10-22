@@ -29,6 +29,14 @@ Step "04b ground cover mask (lawn / dry ground / pavers / parking)" { & $py scri
 Step "03c surrounding terrain / mountains" { & $py scripts\03c_far_terrain.py }
 Step "CARLA validation (LibCarla)" { & .\venv38\Scripts\python.exe scripts\validate_carla_map.py }
 Step "mesh vs OpenDRIVE + spawn points" { & $py scripts\check_mesh_vs_xodr.py }
-Step "QA audit" { & $py scripts\qa_check.py }
+# QA reads the built files and writes only build\qa_report.json: it runs beside the Blender build
+Write-Host "`n=== QA audit (beside the Blender build) ===" -ForegroundColor Cyan
+$qaT = Get-Date
+$qa = Start-Process -FilePath $py -ArgumentList "scripts\qa_check.py" -NoNewWindow -PassThru `
+    -RedirectStandardOutput "build\qa_check.log" -RedirectStandardError "build\qa_check.err.log"
 Step "05 Blender build + FBX export" { & $blender -b --factory-startup --python-exit-code 1 -P scripts\05_blender_build.py }
+$qa.WaitForExit()
+Get-Content "build\qa_check.log" | Write-Host
+if ($qa.ExitCode) { Get-Content "build\qa_check.err.log" | Write-Host; throw "QA audit failed (exit $($qa.ExitCode))" }
+Write-Host ("    QA {0:n0} s (from its start)" -f ((Get-Date) - $qaT).TotalSeconds)
 Write-Host "`nDone. Outputs in export\LA_DTLA (xodr + FBX) and blender\LA_DTLA.blend"

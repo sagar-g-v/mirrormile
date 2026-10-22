@@ -8,6 +8,7 @@ Grid spacing grows from 15 m at the detailed-map edge to ~600 m at the horizon. 
 flat-world engine. The inner edge is a skirt tucked 0.6 m under the detailed terrain.
 Output: build/far_geom.npz, textures/T_LA_Near_D.jpg, textures/T_LA_Far_D.jpg
 """
+import hashlib
 import io
 import json
 import time
@@ -33,17 +34,32 @@ UA = {"User-Agent": "osm2carla/1.0"}
 MAP_CRS = rasterio.crs.CRS.from_proj4(C.MAP_PROJ)
 
 
+CACHE = C.DATA / "cache" / "far_terrain"   # one file per exact request: a rebuild reads the tiles from disk
+
+
 def fetch(svc, bbox, size, extra):
     x0, y0, x1, y1 = bbox
     p = dict(bbox=f"{x0},{y0},{x1},{y1}", bboxSR=C.UTM_EPSG, imageSR=C.UTM_EPSG, size=f"{size[0]},{size[1]}",
              format="tiff", f="image", compression="None", **extra)
-    for attempt in range(4):        # the image services answer 502 / 504 under load: retry with a pause
-        r = requests.get(svc, params=p, headers=UA, timeout=600)
-        if r.status_code not in (502, 503, 504) or attempt == 3:
-            break
-        time.sleep(30 * (attempt + 1))
-    r.raise_for_status()
-    with rasterio.open(io.BytesIO(r.content)) as src:
+    key = hashlib.sha256(json.dumps([svc, sorted((k, str(v)) for k, v in p.items())]).encode()).hexdigest()[:32]
+    cached = CACHE / f"{key}.tif"
+    if cached.exists():
+        content = cached.read_bytes()
+    else:
+        for attempt in range(4):        # the image services answer 502 / 504 under load: retry with a pause
+            r = requests.get(svc, params=p, headers=UA, timeout=600)
+            if r.status_code not in (502, 503, 504) or attempt == 3:
+                break
+            time.sleep(30 * (attempt + 1))
+        r.raise_for_status()
+        content = r.content
+        with rasterio.open(io.BytesIO(content)):      # a readable image only
+            pass
+        CACHE.mkdir(parents=True, exist_ok=True)
+        tmp = cached.with_suffix(".part")
+        tmp.write_bytes(content)
+        tmp.replace(cached)
+    with rasterio.open(io.BytesIO(content)) as src:
         return src.read()
 
 
