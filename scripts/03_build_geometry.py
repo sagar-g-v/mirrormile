@@ -557,7 +557,9 @@ def build_junctions(od, net_file, drive_polys, walk_polys, junction_drive, drive
             zJ = float(np.mean([v[2] for t in tri for v in t])) if tri else float("nan")
             jlist.append((jid, J, zJ))
     patches, corners_all, d_walk = [], [], 0
-    jdrive_u = unary_union([p for v in junction_drive.values() for p in v])
+    # the whole-map unions of drive and walk strips (only read below) on threads while the junctions are built
+    f_all_drive = geom_par.submit(lambda: unary_union(drive_polys + [unary_union([p for v in junction_drive.values() for p in v])]))
+    f_walk_u = geom_par.submit(unary_union, walk_polys)
     for jid, J, zJ in jlist:
         cxy = np.array(J.representative_point().coords[0])
         Jq = J.buffer(3.0)
@@ -643,9 +645,8 @@ def build_junctions(od, net_file, drive_polys, walk_polys, junction_drive, drive
                 zt = zpad(P)
                 LAYERS["SideWalk__Curb"].wall(P, zt - CURB - 0.03, zt)
     print(f"cleanup: dropped {d_walk} sidewalk faces inside junction asphalt (same level)")
-    road_patch = unary_union(patches)
-    all_drive = unary_union(drive_polys + [jdrive_u])
-    return all_drive, unary_union(walk_polys), road_patch, unary_union(corners_all), zroad, zwalk
+    f_patch, f_corners = geom_par.submit(unary_union, patches), geom_par.submit(unary_union, corners_all)
+    return f_all_drive.result(), f_walk_u.result(), f_patch.result(), f_corners.result(), zroad, zwalk
 
 
 # ----------------------------------------------------------------------------------- markings
