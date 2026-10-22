@@ -915,30 +915,33 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, la
     znear = gp[i[:, 0], 2]
     zmin = gp[i, 2].min(1)
     inside = shapely.contains_xy(paved, P[:, 0], P[:, 1])
+    pz_in = None                     # PAVED_Z at the final `inside` points (computed once)
     if inside.any():
         pz = PAVED_Z(P[inside])
         lvl_ok = ~np.isnan(pz) & (np.abs(pz - Z[inside]) < 2.0)
         tmp = np.zeros(len(P), bool); tmp[np.flatnonzero(inside)[lvl_ok]] = True
         inside = tmp
+        pz_in = pz[lvl_ok]
     w = np.clip((d[:, 0] - 0.5) / 8.0, 0, 1) ** 1.5
     Zc = np.where(inside, zmin - 0.35, (znear - 0.03) * (1 - w) + Z * w)
     # far from ground-level roads keep the DEM untouched
     Zc = np.where((d[:, 0] > 9.0) & ~inside, Z, Zc)
     # inside paved areas never let the terrain come closer than 30 cm below the surface
     if inside.any():
-        pz = PAVED_Z(P[inside])
+        pz = pz_in
         Zc[inside] = np.where(np.isnan(pz), Zc[inside], np.minimum(Zc[inside], pz - 0.30))
     cut_v = np.zeros(len(P), bool)
     if lanes is not None:
         ltree, _, lz = lanes
-        vi, pk = ltree.query(shapely.points(P), predicate="dwithin", distance=0.5)
+        Ppts = shapely.points(P)                  # grid points as geometries, for both lane queries
+        vi, pk = ltree.query(Ppts, predicate="dwithin", distance=0.5)
         dz = Zc[vi] - lz[pk]
         push = (dz > -LANE_UNDER) & (dz < LANE_PUSH)
         np.minimum.at(Zc, vi[push], lz[pk[push]] - LANE_UNDER)
         cut_v[vi[(dz >= LANE_PUSH) & (dz < LANE_HEADROOM)]] = True
         # the next grid row (up to one TERRAIN_STEP out) spans the triangles that slope over the lane edge: push
         # it under as well (no cut there - that would open holes beside the road)
-        vo, po = ltree.query(shapely.points(P), predicate="dwithin", distance=TERRAIN_STEP)
+        vo, po = ltree.query(Ppts, predicate="dwithin", distance=TERRAIN_STEP)
         dzo = Zc[vo] - lz[po]
         own = np.zeros(len(P), bool)              # ground next to a lane of its own level (a street above a trench)
         own[vo[np.abs(dzo) < 0.5]] = True
@@ -968,7 +971,7 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, la
         # between them slope through the underpass - drop them (the deck covers the gap)
         ltree, _, lz = lanes
         Vz = Zc[F]
-        fi, pk = ltree.query(shapely.points(P[F].mean(1)), predicate="dwithin", distance=0.5)
+        fi, pk = ltree.query(shapely.points(cen), predicate="dwithin", distance=0.5)
         over = (Vz[fi].max(1) > lz[pk] + 0.15) & (Vz[fi].min(1) < lz[pk] + LANE_HEADROOM)
         drop = np.zeros(len(F), bool); drop[fi[over]] = True
         LANE_TERRAIN["faces_dropped"] = int((drop & ~deep).sum())
@@ -1248,7 +1251,8 @@ def fix_t_junctions(V, F, T, tol=5e-3, maxdz=0.03, iters=8):
         E = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
         fid = np.tile(np.arange(len(F)), 3); slot = np.repeat([0, 1, 2], len(F))
         key = np.sort(E, 1)
-        _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+        # rows (a, b) packed as a * n + b: same grouping and order as unique rows, without sorting row records
+        _, inv, cnt = np.unique(key[:, 0] * np.int64(len(V)) + key[:, 1], return_inverse=True, return_counts=True)
         bnd = cnt[inv.ravel()] == 1
         bE, bf, bs = E[bnd], fid[bnd], slot[bnd]
         bv = np.unique(bE)
