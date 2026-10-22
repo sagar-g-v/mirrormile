@@ -10,6 +10,7 @@ Output: build/far_geom.npz, textures/T_LA_Near_D.jpg, textures/T_LA_Far_D.jpg
 """
 import io
 import json
+import time
 
 import numpy as np
 import rasterio
@@ -36,7 +37,12 @@ def fetch(svc, bbox, size, extra):
     x0, y0, x1, y1 = bbox
     p = dict(bbox=f"{x0},{y0},{x1},{y1}", bboxSR=C.UTM_EPSG, imageSR=C.UTM_EPSG, size=f"{size[0]},{size[1]}",
              format="tiff", f="image", compression="None", **extra)
-    r = requests.get(svc, params=p, headers=UA, timeout=600); r.raise_for_status()
+    for attempt in range(4):        # the image services answer 502 / 504 under load: retry with a pause
+        r = requests.get(svc, params=p, headers=UA, timeout=600)
+        if r.status_code not in (502, 503, 504) or attempt == 3:
+            break
+        time.sleep(30 * (attempt + 1))
+    r.raise_for_status()
     with rasterio.open(io.BytesIO(r.content)) as src:
         return src.read()
 
@@ -133,7 +139,8 @@ def main():
     V = np.column_stack([X, Y, Z])
 
     # textures
-    img, itr = mosaic(NAIP_SVC, bb_far, 4, 1000, 3, dict(bandIds="0,1,2", pixelType="U8", interpolation="RSP_BilinearInterpolation"))
+    # 8 x 8 tiles of 500 px (same pixels as 4 x 4 x 1000): an 18 km tile timed out at the service (504)
+    img, itr = mosaic(NAIP_SVC, bb_far, 8, 500, 3, dict(bandIds="0,1,2", pixelType="U8", interpolation="RSP_BilinearInterpolation"))
     Image.fromarray(to_texture(img, itr, FAR_RADIUS, sea, far_tr)).save(C.TEX / "T_LA_Far_D.jpg", quality=90)
     img, itr = mosaic(NAIP_SVC, bb_near, 4, 1000, 3, dict(bandIds="0,1,2", pixelType="U8", interpolation="RSP_BilinearInterpolation"))
     Image.fromarray(to_texture(img, itr, NEAR)).save(C.TEX / "T_LA_Near_D.jpg", quality=90)
