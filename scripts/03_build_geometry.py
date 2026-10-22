@@ -897,7 +897,7 @@ LANE_HEADROOM = 4.5    # m kept free above a vehicle lane (tunnel / underpass ce
 LANE_TERRAIN = {}      # terrain vertices pushed under / cut over vehicle lanes (stats)
 
 
-def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, lanes=None):
+def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, lanes=None, paved_in=None):
     """Terrain conformed under ground-level pavement only: bridges keep the ground under them,
     tunnels keep the ground above them (and the ground is carved where it would cut into a
     tunnel, near its portals). With lanes (lane_pieces): no terrain inside the space a car occupies
@@ -954,7 +954,7 @@ def build_terrain(dem, extent, paved, paved_pts, tunnel_fp=None, roof_z=None, la
     F = np.concatenate([np.stack([a, b, c], 1), np.stack([a, c, dd], 1)])
     # drop faces deep inside ground-level paved areas (never visible, saves ~40% triangles)
     cen = P[F].mean(1)
-    deep = shapely.contains_xy(paved.buffer(-1.5), cen[:, 0], cen[:, 1]) & inside[F].all(1)
+    deep = shapely.contains_xy(paved.buffer(-1.5) if paved_in is None else paved_in, cen[:, 0], cen[:, 1]) & inside[F].all(1)
     # carve the ground where it would cut into a tunnel (near portals)
     if tunnel_fp is not None and not tunnel_fp.is_empty:
         intun = shapely.contains_xy(tunnel_fp.buffer(0.5), cen[:, 0], cen[:, 1])
@@ -1127,7 +1127,7 @@ def lane_passage(g, base, top, lanes):
     return g.difference(unary_union(list(lpolys[k])).buffer(0.3)), len(k)
 
 
-def build_buildings(dem, extent, paved, lanes=None):
+def build_buildings(dem, extent, paved, lanes=None, paved_off=None):
     box = shapely.box(*extent)
     polys = osm_polygons()
     parts = [(p, t) for p, t in polys if "building:part" in t and t.get("building:part") != "no"]
@@ -1135,7 +1135,7 @@ def build_buildings(dem, extent, paved, lanes=None):
     stats = defaultdict(int)
     tiers_all = load_building_tiers()
     # the paved area grown by 5 cm, once (buffering the whole map's paving per building took ~40 min)
-    paved_off = paved.buffer(0.05)
+    paved_off = paved.buffer(0.05) if paved_off is None else paved_off
     shapely.prepare(paved)
     for raw, tags in polys:
         if is_underground(tags):
@@ -1803,6 +1803,7 @@ def main():
     PAVED_Z = lambda Q: np.fmin(road_z(Q, "min"), walk_z(Q, "min"))
 
     paved = unary_union([all_drive, walk_u, road_patch, corner_u]).buffer(0.05)
+    f_paved_in = geom_par.submit(paved.buffer, -1.5)     # for the terrain, on a thread meanwhile
     rx0, ry0, rx1, ry1 = paved.bounds
     dem = Dem(C.DEM_UTM, filt=3)
     # terrain extent: road extent + margin, clamped to DEM coverage (in map frame)
@@ -1819,15 +1820,17 @@ def main():
     top_z = lambda Q, zr: np.fmax(road_z(Q, "near", zref=zr, tol=1.0), walk_z(Q, "near", zref=zr, tol=1.0))
     lanes = lane_pieces(od)
     sstats, ground_paved = build_structures(od, dem, top_z, paved, lanes)
+    f_ground_off = geom_par.submit(ground_paved.buffer, 0.05)   # for the buildings, on a thread meanwhile
     print("structures:", sstats)
     runs = json.loads((C.BUILD / "road_levels.json").read_text())
     tunnel_fp = structure_footprints(od, runs, ("tunnel",))
     wall = LAYERS["Wall__Struct"].arrays()
     roof_z = MeshZ(wall[0], wall[1]) if wall is not None else (lambda Q, how="max": np.full(len(Q), np.nan))
     paved_pts = np.concatenate([dpts, wpts])
-    nt = build_terrain(dem, extent, paved, paved_pts, tunnel_fp, lambda Q: roof_z(Q, "max"), lanes)
+    nt = build_terrain(dem, extent, paved, paved_pts, tunnel_fp, lambda Q: roof_z(Q, "max"), lanes,
+                       paved_in=f_paved_in.result())
     print("terrain tris", nt, "| at vehicle lanes:", LANE_TERRAIN)
-    bstats = build_buildings(Dem(C.DEM_UTM, filt=5), extent, ground_paved, lanes)
+    bstats = build_buildings(Dem(C.DEM_UTM, filt=5), extent, ground_paved, lanes, paved_off=f_ground_off.result())
     print("buildings", bstats)
     summary = export(extent)
     meta = json.loads(C.META_FILE.read_text()) if C.META_FILE.exists() else {}
