@@ -1339,38 +1339,48 @@ def finalize_surfaces():
     """Hole filling, weld + T-junction repair of asphalt and sidewalk tops, upward orientation;
     paint projected onto the final asphalt."""
     stats = {}
-    # 1. fill small enclosed holes in the asphalt (gaps between strips/patches) that no sidewalk covers
-    L = LAYERS["Road__Asphalt"]
-    V, F, UV, T = L.arrays()
-    tri = shapely.polygons(V[F][:, :, :2])
-    road_u = robust_union(tri[shapely.area(tri) > 1e-7], grid=1e-3)   # as the sidewalk below (GEOS can fail on one pass)
     WV, WF, _, _ = LAYERS["SideWalk__Concrete"].arrays()
     walk_u = robust_union(shapely.polygons(WV[WF][:, :, :2]), grid=1e-3)
-    vt = cKDTree(V[:, :2])
-    zfill = lambda P: idw(vt, V[:, 2], P, k=6)
-    filled = 0
-    tri_tree = shapely.STRtree(tri)
-    for part in shapely.get_parts(road_u):
-        for ring in part.interiors:
-            h = Polygon(ring)
-            if h.area > 60:
-                continue
-            # the grid-snapped union can report phantom holes: re-test against an exact local union
-            near = tri[tri_tree.query(h.buffer(0.05), predicate="intersects")]
-            near = near[shapely.area(near) > 1e-9]
-            try:
-                covered = shapely.union_all(near) if len(near) else Polygon()
-                h = polys_only(h.difference(covered))
-            except shapely.errors.GEOSException:
-                continue
-            for piece in shapely.get_parts(polys_only(h.difference(walk_u))):
-                if piece.area < 0.002:
+
+    def fill_holes(snapped=False):
+        """1. fill small enclosed holes in the asphalt (gaps between strips/patches) that no sidewalk covers.
+        snapped: also the holes of the union snapped to 5 mm (a gap joined to a block's interior by a slit too fine for
+        the weld), filling only real gaps there - pieces of >= 0.05 m2 and >= 3 cm mean width (2 area / perimeter): the
+        snapped rings miss the triangle edges by up to 2.5 mm and leave slivers along them"""
+        L = LAYERS["Road__Asphalt"]
+        V, F, UV, T = L.arrays()
+        tri = shapely.polygons(V[F][:, :, :2])
+        road_u = robust_union(tri[shapely.area(tri) > 1e-7], grid=1e-3)   # as the sidewalk (GEOS can fail on one pass)
+        vt = cKDTree(V[:, :2])
+        zfill = lambda P: idw(vt, V[:, 2], P, k=6)
+        filled = 0
+        tri_tree = shapely.STRtree(tri)
+        rings = [(r, False) for part in shapely.get_parts(road_u) for r in part.interiors]
+        if snapped:
+            rings += [(r, True) for part in shapely.get_parts(shapely.set_precision(road_u, 0.005)) for r in part.interiors]
+        for ring, from_snap in rings:
+                h = Polygon(ring)
+                if h.area > 60:
                     continue
-                res = triangulate(piece, zfill, planar_uv, seg=1e9)
-                if res:
-                    L.add(*res); filled += 1
-    stats["holes_filled"] = filled
-    for name in ("Road__Asphalt", "SideWalk__Concrete"):
+                # the grid-snapped union can report phantom holes: re-test against an exact local union
+                near = tri[tri_tree.query(h.buffer(0.05), predicate="intersects")]
+                near = near[shapely.area(near) > 1e-9]
+                try:
+                    covered = shapely.union_all(near) if len(near) else Polygon()
+                    h = polys_only(h.difference(covered))
+                except shapely.errors.GEOSException:
+                    continue
+                for piece in shapely.get_parts(polys_only(h.difference(walk_u))):
+                    if piece.area < 0.002:
+                        continue
+                    if from_snap and (piece.area < 0.05 or 2 * piece.area / piece.length < 0.03):
+                        continue
+                    res = triangulate(piece, zfill, planar_uv, seg=1e9)
+                    if res:
+                        L.add(*res); filled += 1
+        return filled
+
+    def weld_layer(name):
         L = LAYERS[name]
         V, F, UV, T = L.arrays()
         n0 = len(F)
@@ -1383,7 +1393,22 @@ def finalize_surfaces():
         F = np.where((nz < 0)[:, None], F[:, ::-1], F)
         L.V, L.F, L.UV, L.T, L.n = [V], [F], [UV], [T], len(V)
         L.O = [np.full(len(F), -1)]
-        stats[name] = (n0, len(F), ins, int((nz < 0).sum()))
+        return (n0, len(F), ins, int((nz < 0).sum()))
+
+    stats["holes_filled"] = fill_holes()
+    for name in ("Road__Asphalt", "SideWalk__Concrete"):
+        stats[name] = weld_layer(name)
+    # a gap a hairline slit joined to a block's interior becomes a hole of its own only once the weld has closed the
+    # slit (vertices 1.5 mm apart merged): fill and weld the asphalt again until no new hole appears (LA: a 0.47 m2
+    # gap stayed open; the re-weld then closed the slits of two more)
+    late = []
+    for _ in range(4):
+        n = fill_holes(snapped=True)
+        if not n:
+            break
+        late.append(n)
+        stats["Road__Asphalt_rewelded"] = weld_layer("Road__Asphalt")
+    stats["holes_filled_after_weld"] = late
     RV, RF = LAYERS["Road__Asphalt"].V[0], LAYERS["Road__Asphalt"].F[0]
     road_z = MeshZ(RV, RF)
     dropped = 0
