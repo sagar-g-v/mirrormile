@@ -1342,25 +1342,33 @@ def finalize_surfaces():
     WV, WF, _, _ = LAYERS["SideWalk__Concrete"].arrays()
     walk_u = robust_union(shapely.polygons(WV[WF][:, :, :2]), grid=1e-3)
 
-    def fill_holes(snapped=False):
-        """1. fill small enclosed holes in the asphalt (gaps between strips/patches) that no sidewalk covers.
+    def fill_holes(snapped=False, window=None):
+        """1. fill small enclosed holes in the asphalt (gaps between strips/patches) that no sidewalk covers; returns
+        (holes filled, the pieces filled).
         snapped: also the holes of the union snapped to 5 mm (a gap joined to a block's interior by a slit too fine for
         the weld), filling only real gaps there - pieces of >= 0.05 m2 and >= 3 cm mean width (2 area / perimeter): the
-        snapped rings miss the triangle edges by up to 2.5 mm and leave slivers along them"""
+        snapped rings miss the triangle edges by up to 2.5 mm and leave slivers along them.
+        window: only the holes inside this area (1 m from its edge), from the triangles that touch it - exact there"""
         L = LAYERS["Road__Asphalt"]
         V, F, UV, T = L.arrays()
         tri = shapely.polygons(V[F][:, :, :2])
+        core = None
+        if window is not None:
+            shapely.prepare(window)
+            tri = tri[shapely.intersects(window, tri)]
+            core = window.buffer(-1.0)
+            shapely.prepare(core)
         road_u = robust_union(tri[shapely.area(tri) > 1e-7], grid=1e-3)   # as the sidewalk (GEOS can fail on one pass)
         vt = cKDTree(V[:, :2])
         zfill = lambda P: idw(vt, V[:, 2], P, k=6)
-        filled = 0
+        filled, pieces = 0, []
         tri_tree = shapely.STRtree(tri)
         rings = [(r, False) for part in shapely.get_parts(road_u) for r in part.interiors]
         if snapped:
             rings += [(r, True) for part in shapely.get_parts(shapely.set_precision(road_u, 0.005)) for r in part.interiors]
         for ring, from_snap in rings:
                 h = Polygon(ring)
-                if h.area > 60:
+                if h.area > 60 or (core is not None and not core.contains(h)):
                     continue
                 # the grid-snapped union can report phantom holes: re-test against an exact local union
                 near = tri[tri_tree.query(h.buffer(0.05), predicate="intersects")]
@@ -1377,8 +1385,8 @@ def finalize_surfaces():
                         continue
                     res = triangulate(piece, zfill, planar_uv, seg=1e9)
                     if res:
-                        L.add(*res); filled += 1
-        return filled
+                        L.add(*res); filled += 1; pieces.append(piece)
+        return filled, pieces
 
     def weld_layer(name):
         L = LAYERS[name]
@@ -1395,19 +1403,22 @@ def finalize_surfaces():
         L.O = [np.full(len(F), -1)]
         return (n0, len(F), ins, int((nz < 0).sum()))
 
-    stats["holes_filled"] = fill_holes()
+    stats["holes_filled"] = fill_holes()[0]
     for name in ("Road__Asphalt", "SideWalk__Concrete"):
         stats[name] = weld_layer(name)
     # a gap a hairline slit joined to a block's interior becomes a hole of its own only once the weld has closed the
     # slit (vertices 1.5 mm apart merged): fill and weld the asphalt again until no new hole appears (LA: a 0.47 m2
     # gap stayed open; the re-weld then closed the slits of two more)
-    late = []
+    # After the first of these passes a re-weld can only merge vertices of the pieces just filled (every other pair
+    # within 1.5 mm was merged already), so later passes look only around them (a whole-map union was ~10 s per pass)
+    late, window = [], None
     for _ in range(4):
-        n = fill_holes(snapped=True)
+        n, pieces = fill_holes(snapped=True, window=window)
         if not n:
             break
         late.append(n)
         stats["Road__Asphalt_rewelded"] = weld_layer("Road__Asphalt")
+        window = shapely.union_all([p.buffer(15.0) for p in pieces])
     stats["holes_filled_after_weld"] = late
     RV, RF = LAYERS["Road__Asphalt"].V[0], LAYERS["Road__Asphalt"].F[0]
     road_z = MeshZ(RV, RF)
