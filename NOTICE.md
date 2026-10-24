@@ -48,7 +48,11 @@ GPL-compatible licence for it.
 
 ## When packaging for CARLA / Unreal Engine
 
-- Placed CARLA vegetation meshes are CARLA content: CARLA code is MIT, CARLA assets are CC-BY 4.0,
+- Placed CARLA vegetation meshes, street props (benches, bins, bus shelters, hydrants, bike racks, bollards, ATMs,
+  speed bumps; `06_ue_import_carla.py` PROP_MESHES), streetlights and traffic lights are CARLA content, and the
+  maps' weather response reads CARLA's weather material parameters: CARLA code is MIT, CARLA assets are CC-BY 4.0,
   so attribute "CARLA" if you redistribute them.
+- Street-prop positions come from OpenStreetMap point features (Overpass API, `03g_street_props.py`), covered by the
+  ODbL attribution above.
 - Packaged Unreal Engine builds fall under the Unreal Engine EULA, which covers royalties and seats
   depending on revenue and use. Check the current terms.

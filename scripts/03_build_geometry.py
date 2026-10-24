@@ -741,7 +741,9 @@ def build_markings(od):
                         continue
                     sr = r.sample_s(s[lo], s[hi])
                     mark_strip(r, sr, r.lane_offset(sr) + sgn * 0.10, 0.05, "RoadLine__Yellow")
-            # freeways / ramps: solid white right edge line, solid yellow left edge line (MUTCD)
+            # freeways / ramps: solid white right edge line, solid yellow left edge line (MUTCD), at the edge of the
+            # travel lane - the border the OpenDRIVE roadMark (and CARLA's lane marking) is on - 1 cm inside it
+            # (0.25 m in before: 41 % of CARLA's solid-marked borders had no paint within 15 cm)
             if types.get(r.id) in FREEWAY:
                 s_e = r.sample_s(sec.s, sec.e, max_step=3.0)
                 if len(s_e) >= 2:
@@ -751,9 +753,10 @@ def build_markings(od):
                             continue
                         sg = -1 if side is rdrive else 1
                         # left edge of travel = inner border of the innermost lane (unless opposing traffic)
+                        inset = MARK_W / 2 + 0.02           # centre 8 cm in; the 14 cm line ends 1 cm inside
                         if not (ldrive and rdrive):
-                            mark_strip(r, s_e, Be[side[0].id][0] + sg * 0.25, MARK_W / 2 + 0.01, "RoadLine__Yellow")
-                        mark_strip(r, s_e, Be[side[-1].id][1] - sg * 0.25, MARK_W / 2 + 0.01, "RoadLine__White")
+                            mark_strip(r, s_e, Be[side[0].id][0] + sg * inset, MARK_W / 2 + 0.01, "RoadLine__Yellow")
+                        mark_strip(r, s_e, Be[side[-1].id][1] - sg * inset, MARK_W / 2 + 0.01, "RoadLine__White")
             # lane dividers (outer border of each lane, if next lane outward is also a road lane)
             for side in (sec.left, sec.right):
                 for i, lane in enumerate(side[:-1]):

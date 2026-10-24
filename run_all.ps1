@@ -27,6 +27,7 @@ Step "03 meshes" { & $py scripts\03_build_geometry.py }
 Step "03d roof materials" { & $py scripts\03d_roofs.py }
 Step "03e street furniture (traffic lights, stop signs, streetlights)" { & $py scripts\03e_street_furniture.py }
 Step "03f storefronts (real shop data, signs, night lighting)" { & $py scripts\03f_storefronts.py }
+Step "03g street props (benches, bins, hydrants, bus shelters ... at their OSM positions)" { & $py scripts\03g_street_props.py }
 Step "03b vegetation (lidar + NDVI)" { & $py scripts\03b_vegetation.py }
 Step "04b ground cover mask (lawn / dry ground / pavers / parking)" { & $py scriptsb_ground_mask.py }
 Step "03c surrounding terrain / mountains" { & $py scripts\03c_far_terrain.py }
