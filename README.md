@@ -103,5 +103,5 @@ segmentation (the meshes carry CARLA's semantic tags through their folder), dept
 ## Data and licensing
 
 Generated maps contain third-party data with attribution and share-alike obligations; see
-[NOTICE.md](NOTICE.md). The MirrorMile source code is proprietary; see [LICENSE](LICENSE).
+[NOTICE.md](NOTICE.md). The MirrorMile source code is licensed under the Apache License 2.0; see [LICENSE](LICENSE).
 Map data © OpenStreetMap contributors (ODbL); elevation and lidar: USGS 3DEP; imagery: USDA NAIP.

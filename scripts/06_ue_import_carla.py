@@ -215,11 +215,127 @@ def make_white_linear():
 
 
 # ------------------------------------------------------------------------ materials
+# CARLA weather on our surfaces: CARLA's weather blueprint writes Wetness / Puddles into this material parameter
+# collection (Town materials read it); 0 in dry weather, so a dry map renders exactly as without the block
+WEATHER_MPC = "/Game/Carla/Blueprints/Weather/Materials/WeatherMaterialParameters"
+WEATHER_SCALE = 1.0          # collection value meaning "fully wet"
+# material -> (wetness response, puddle response); not listed: (0, 0)
+WET_RESPONSE = {
+    **{k: (1.0, 1.0) for k in ("Asphalt", "White", "Yellow", "Concrete", "BridgeConc")},
+    "Curb": (1.0, 0.0), "Struct": (0.8, 0.0), "Pier": (0.8, 0.0), "PierConc": (0.8, 0.0), "Grass": (0.6, 0.0),
+    "Ortho": (1.0, 0.4),     # terrain (ground-cover material): lawn and dirt hold fewer puddles than pavement
+    **{k: (0.5, 0.0) for k in ("Brick", "Stucco", "Office", "OfficeTan", "Near", "Far")},
+    **{k: (0.8, 0.0) for k in ("Roof", "RoofWhite", "RoofLight", "RoofGray", "RoofDark")},
+    **{k: (0.3, 0.0) for k in ("SignPost", "Metal", "SignAtlas", "Awning")},
+}
+
+
+def weather_block(m, col, rough, nrm, x, y, wet, puddles):
+    """(colour, roughness, normal) of a surface under CARLA's weather: wetness darkens it to 55 % and makes it glossy
+    (roughness -> 0.12); puddles (where a 2.5 m world-space noise passes a threshold that falls as Puddles rises) are
+    still water: 80 % darker again, roughness 0.03, flat normal. WetResponse / PuddleResponse (material instance
+    parameters, defaults wet / puddles) scale both per surface. col / rough / nrm: (expression, output name)."""
+    link = MEL.connect_material_expressions
+    mpc = unreal.load_asset(WEATHER_MPC)
+
+    def E(cls, dx, dy):
+        return MEL.create_material_expression(m, cls, x + dx, y + dy)
+
+    def coll(name, dy):
+        e = E(unreal.MaterialExpressionCollectionParameter, 0, dy)
+        e.set_editor_property("collection", mpc); e.set_editor_property("parameter_name", name)
+        return e
+
+    def scalar(name, default, dy):
+        e = E(unreal.MaterialExpressionScalarParameter, 0, dy)
+        e.set_editor_property("parameter_name", name); e.set_editor_property("default_value", default)
+        return e
+
+    def mul(a, b, dx, dy, const_b=None):
+        e = E(unreal.MaterialExpressionMultiply, dx, dy)
+        link(a[0], a[1], e, "A")
+        if const_b is None:
+            link(b[0], b[1], e, "B")
+        else:
+            e.set_editor_property("const_b", const_b)
+        return e
+
+    def sat(a, dx, dy):
+        e = E(unreal.MaterialExpressionSaturate, dx, dy)
+        link(a, "", e, "")
+        return e
+
+    def lerp(alpha, dx, dy, a=None, const_a=0.0, b=None, const_b=0.0):
+        e = E(unreal.MaterialExpressionLinearInterpolate, dx, dy)
+        if a is not None:
+            link(a[0], a[1], e, "A")
+        else:
+            e.set_editor_property("const_a", const_a)
+        if b is not None:
+            link(b[0], b[1], e, "B")
+        else:
+            e.set_editor_property("const_b", const_b)
+        link(alpha, "", e, "Alpha")
+        return e
+
+    wet_c, pud_c = coll("Wetness", 0), coll("Puddles", 120)
+    wr, pr = scalar("WetResponse", wet, 240), scalar("PuddleResponse", puddles, 360)
+    # surfaces are wet in rain and with standing water too: CARLA's rain presets leave Wetness at 0 (HardRainNoon:
+    # precipitation 100, deposits 90, wetness 0), so the driver is max(Wetness, RainWetness x max(Precipitation, Puddles))
+    rain_c = coll("Precipitation", -120)
+    rain_w = scalar("RainWetness", 1.0, -240)
+    mx1 = E(unreal.MaterialExpressionMax, 100, -120)
+    link(rain_c, "", mx1, "A"); link(pud_c, "", mx1, "B")
+    mx2 = E(unreal.MaterialExpressionMax, 300, -60)
+    link(wet_c, "", mx2, "A"); link(mul((mx1, ""), (rain_w, ""), 200, -120), "", mx2, "B")
+    W = sat(mul((mul((mx2, ""), None, 400, -60, const_b=1.0 / WEATHER_SCALE), ""), (wr, ""), 500, 0), 600, 0)
+    P01 = sat(mul((pud_c, ""), None, 200, 120, const_b=1.0 / WEATHER_SCALE), 400, 120)
+    wp = E(unreal.MaterialExpressionWorldPosition, 0, 480)
+    noise = E(unreal.MaterialExpressionNoise, 200, 480)
+    noise.set_editor_property("scale", 0.004)               # UE units: features ~2.5 m
+    noise.set_editor_property("output_min", 0.0)
+    noise.set_editor_property("output_max", 1.0)
+    link(wp, "", noise, "Position")
+    thr = E(unreal.MaterialExpressionSubtract, 600, 240)
+    thr.set_editor_property("const_a", 1.0)
+    link(mul((P01, ""), None, 500, 200, const_b=0.6), "", thr, "B")    # threshold 1 - 0.6 Puddles
+    diff = E(unreal.MaterialExpressionSubtract, 800, 400)
+    link(noise, "", diff, "A"); link(thr, "", diff, "B")
+    P = mul((sat(mul((diff, ""), None, 900, 400, const_b=5.0), 1000, 400), ""), (pr, ""), 1100, 400)
+    # no puddle at all without CARLA puddles (the noise overshoots 1, so the threshold alone left patches in dry
+    # weather), and only on flat ground: world normal z above PuddleFlatness (about 16 deg of slope at 0.96)
+    gate = sat(mul((P01, ""), None, 1000, 520, const_b=10.0), 1100, 520)
+    nz = E(unreal.MaterialExpressionComponentMask, 900, 640)
+    nz.set_editor_property("r", False); nz.set_editor_property("g", False); nz.set_editor_property("b", True)
+    link(E(unreal.MaterialExpressionVertexNormalWS, 750, 640), "", nz, "")
+    flat_min = scalar("PuddleFlatness", 0.96, 760)
+    above = E(unreal.MaterialExpressionSubtract, 1000, 640)
+    link(nz, "", above, "A"); link(flat_min, "", above, "B")
+    flat = sat(mul((above, ""), None, 1100, 640, const_b=25.0), 1200, 640)
+    P = mul((mul((P, ""), (gate, ""), 1200, 400), ""), (flat, ""), 1300, 400)
+    c1 = mul(col, (lerp(W, 800, -200, const_a=1.0, const_b=0.55), ""), 1000, -200)
+    c2 = mul((c1, ""), (lerp(P, 1100, -100, const_a=1.0, const_b=0.8), ""), 1250, -200)
+    r1 = lerp(W, 1000, 0, a=rough, const_b=0.12)
+    r2 = lerp(P, 1250, 0, a=(r1, ""), const_b=0.03)
+    up = E(unreal.MaterialExpressionConstant3Vector, 1000, 600)
+    up.set_editor_property("constant", unreal.LinearColor(0, 0, 1, 0))
+    n2 = lerp(P, 1250, 600, a=nrm, b=(up, ""))
+    return c2, r2, n2
+
+
+def has_weather(m):   # the current weather block (PuddleFlatness came with the dry-weather gate)
+    return "RainWetness" in [str(n) for n in MEL.get_scalar_parameter_names(m)]
+
+
 def master_material(white_lin):
     path = f"{MAT_DIR}/M_{MAP}_Master"
     if EAL.does_asset_exist(path):
-        return unreal.load_asset(path)
-    m = AT.create_asset(f"M_{MAP}_Master", MAT_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        m = unreal.load_asset(path)
+        if has_weather(m):
+            return m
+        MEL.delete_all_material_expressions(m)   # built before the weather block: rebuilt in place
+    else:
+        m = AT.create_asset(f"M_{MAP}_Master", MAT_DIR, unreal.Material, unreal.MaterialFactoryNew())
 
     def param_tex(name, x, y, sampler, default):
         e = MEL.create_material_expression(m, unreal.MaterialExpressionTextureSampleParameter2D, x, y)
@@ -246,10 +362,11 @@ def master_material(white_lin):
     MEL.connect_material_expressions(tint, "", mul_c, "B")
     MEL.connect_material_expressions(rough, "R", mul_r, "A")
     MEL.connect_material_expressions(rs, "", mul_r, "B")
-    MEL.connect_material_property(mul_c, "", unreal.MaterialProperty.MP_BASE_COLOR)
-    MEL.connect_material_property(mul_r, "", unreal.MaterialProperty.MP_ROUGHNESS)
+    wc, wr, wn = weather_block(m, (mul_c, ""), (mul_r, ""), (nrm, "RGB"), -2000, -1400, wet=0.0, puddles=0.0)
+    MEL.connect_material_property(wc, "", unreal.MaterialProperty.MP_BASE_COLOR)
+    MEL.connect_material_property(wr, "", unreal.MaterialProperty.MP_ROUGHNESS)
     MEL.connect_material_property(met, "", unreal.MaterialProperty.MP_METALLIC)
-    MEL.connect_material_property(nrm, "RGB", unreal.MaterialProperty.MP_NORMAL)
+    MEL.connect_material_property(wn, "", unreal.MaterialProperty.MP_NORMAL)
     em = MEL.create_material_expression(m, unreal.MaterialExpressionScalarParameter, -500, 500)
     em.set_editor_property("parameter_name", "EmissiveStrength"); em.set_editor_property("default_value", 0.0)
     mul_e = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -300, 450)
@@ -352,7 +469,7 @@ def ground_material(rebuild=False):
     path = f"{MAT_DIR}/M_{MAP}_Ground"
     if EAL.does_asset_exist(path):
         m = unreal.load_asset(path)
-        if not rebuild:
+        if not rebuild and has_weather(m):
             return m
         MEL.delete_all_material_expressions(m)   # rebuild in place: never delete a material on screen
     else:
@@ -421,9 +538,11 @@ def ground_material(rebuild=False):
     MEL.connect_material_expressions(macro, "G", lerp, "Alpha")
     col = MEL.create_material_expression(m, unreal.MaterialExpressionMultiply, -400, 0)
     MEL.connect_material_expressions(sums["col"], "", col, "A"); MEL.connect_material_expressions(lerp, "", col, "B")
-    MEL.connect_material_property(col, "", unreal.MaterialProperty.MP_BASE_COLOR)
-    MEL.connect_material_property(sums["nrm"], "", unreal.MaterialProperty.MP_NORMAL)
-    MEL.connect_material_property(sums["rgh"], "", unreal.MaterialProperty.MP_ROUGHNESS)
+    # ground cover: lawn and dirt hold fewer puddles than pavement
+    wc, wr, wn = weather_block(m, (col, ""), (sums["rgh"], ""), (sums["nrm"], ""), -400, 3400, wet=1.0, puddles=0.4)
+    MEL.connect_material_property(wc, "", unreal.MaterialProperty.MP_BASE_COLOR)
+    MEL.connect_material_property(wn, "", unreal.MaterialProperty.MP_NORMAL)
+    MEL.connect_material_property(wr, "", unreal.MaterialProperty.MP_ROUGHNESS)
     MEL.recompile_material(m)
     EAL.save_loaded_asset(m)
     log("ground material:", path)
@@ -449,6 +568,9 @@ def material_instances(master, ground=None):
             mi_name, MAT_DIR, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
         if name == "Ortho" and ground is not None:      # terrain: ground-cover blend (04b), not the photo
             MEL.set_material_instance_parent(mi, ground)
+            wet, pud = WET_RESPONSE[name]
+            MEL.set_material_instance_scalar_parameter_value(mi, "WetResponse", wet)
+            MEL.set_material_instance_scalar_parameter_value(mi, "PuddleResponse", pud)
             EAL.save_loaded_asset(mi, only_if_is_dirty=False)   # re-parenting does not mark it dirty
             out[f"M_{MAP}_{name}"] = mi
             continue
@@ -473,7 +595,10 @@ def material_instances(master, ground=None):
         MEL.set_material_instance_vector_parameter_value(mi, "Tint", unreal.LinearColor(*tint, 1))
         MEL.set_material_instance_scalar_parameter_value(mi, "RoughnessScale", rscale)
         MEL.set_material_instance_scalar_parameter_value(mi, "Metallic", metal)
-        EAL.save_loaded_asset(mi)
+        wet, pud = WET_RESPONSE.get(name, (0.0, 0.0))
+        MEL.set_material_instance_scalar_parameter_value(mi, "WetResponse", wet)
+        MEL.set_material_instance_scalar_parameter_value(mi, "PuddleResponse", pud)
+        EAL.save_loaded_asset(mi, only_if_is_dirty=False)
         out[f"M_{MAP}_{name}"] = mi
     return out
 
@@ -647,6 +772,7 @@ def build_level(meshes):
     guarded("place_shop_lights", place_shop_lights, eas)
     if CARLA_PROPS:
         guarded("place_street_furniture", place_street_furniture, eas)
+        guarded("place_street_props", place_street_props, eas)
     place_spawn_points(eas)
     guarded("setup_sky", setup_sky, eas)
     guarded("register_weather", register_weather)
@@ -683,6 +809,69 @@ def spawn_only():
     place_spawn_points(actor_subsystem())
     les.save_current_level()
     log("DONE (spawn stage)")
+
+
+# street props at their OSM positions (03g_street_props.py) -> CARLA's own prop meshes (Static/Static: tagged Static)
+PROP_MESHES = {
+    "bench": ["SM_Bench01", "SM_Bench02"],
+    "bin": ["SM_TrashCan01", "SM_TrashCan02", "SM_TrashCan03"],
+    "bus_shelter": ["SM_BusStation"],
+    "bike_rack": ["SM_BikeParking01", "SM_BikeParking02"],
+    "hydrant": ["SM_FloorFireHydrant"],
+    "bollard": ["SM_Bollard_Grey"],
+    "atm": ["SM_Atm"],
+    "parking_meter": ["SM_Parkingmeter"],
+    "cabinet": ["SM_ElectricBox01", "SM_ElectricBox02", "SM_ElectricBox03"],
+    "advertising": ["SM_AdvertisingPost"],
+    "planter": ["SM_PlanterGrass01", "SM_PlanterGrass02"],
+    "speed_bump": ["SM_SpeedBump_10m"],
+}
+
+
+def place_street_props(eas):
+    """One static-mesh actor per OSM street prop (build/street_props.json). The 03g heading is the direction the prop
+    runs along (parallel to the road; speed bumps across it); a mesh whose long side is its Y axis turns 90 deg."""
+    f = f"{PIPE}/build/street_props.json"
+    for a in eas.get_all_level_actors():
+        if a.get_actor_label().startswith(f"PROP_{MAP}_"):
+            eas.destroy_actor(a)
+    if not os.path.exists(f):
+        return
+    cache, n, missing = {}, 0, set()
+    for i, p in enumerate(json.load(open(f))["props"]):
+        names = PROP_MESHES.get(p["kind"])
+        if not names:
+            continue
+        name = names[p["osm_id"] % len(names)]
+        if name not in cache:
+            path = f"/Game/Carla/Static/Static/{name}"
+            sm = unreal.load_asset(path) if EAL.does_asset_exist(path) else None
+            if sm is None:
+                missing.add(name)
+            else:
+                b = sm.get_bounding_box()
+                corners = [(x, y) for x in (b.min.x, b.max.x) for y in (b.min.y, b.max.y)]   # cm, mesh frame
+                cache[name] = (sm, 90.0 if (b.max.y - b.min.y) > (b.max.x - b.min.x) else 0.0, corners)
+            cache.setdefault(name, None)
+        if cache[name] is None:
+            continue
+        sm, turn, corners = cache[name]
+        yaw = -(p["heading"] + turn)                          # OpenDRIVE heading (CCW, y up) -> UE yaw (y down)
+        # back from the road by the prop's own size: no part of it reaches nearer the road than 0.2 m behind its OSM
+        # point (a bus shelter centred on the point overhung the lane: Traffic Manager cars hit two of them)
+        h, c, s = math.radians(p["heading"]), math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        reach = max(((x * c - y * s) * math.cos(h) - (x * s + y * c) * math.sin(h)) / 100.0 for x, y in corners)
+        back = reach + 0.2 if p["kind"] != "speed_bump" else 0.0
+        px, py = p["x"] - math.cos(h) * back, p["y"] - math.sin(h) * back
+        a = eas.spawn_actor_from_object(sm, unreal.Vector(px * 100, -py * 100, p["z"] * 100),
+                                        unreal.Rotator(0, 0, yaw))
+        if a is None:
+            continue
+        a.set_actor_label(f"PROP_{MAP}_{i:04d}")
+        a.set_folder_path(f"{MAP}/StreetProps/{p['kind']}")
+        a.get_component_by_class(unreal.StaticMeshComponent).set_mobility(unreal.ComponentMobility.STATIC)
+        n += 1
+    log("street props:", n, "| meshes missing:", sorted(missing))
 
 
 def place_tunnel_lights(eas):
